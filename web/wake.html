@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>正在启动工作区</title>
+<link rel="stylesheet" href="/design.css" />
+<style>
+  /* 「AI 核心」加载体 —— 与实例页恢复浮层**同一套视觉语言**（配色跟随平台主题） */
+  .wk-orb{position:relative;width:86px;height:86px;margin:2px auto 16px}
+  .wk-halo{position:absolute;inset:-18px;border-radius:50%;
+    background:radial-gradient(circle, rgba(83,74,183,.20), rgba(139,124,246,.12) 46%, transparent 70%);
+    animation:wk-halo 2.6s ease-in-out infinite}
+  .wk-arc{position:absolute;inset:0;border-radius:50%;
+    background:conic-gradient(from 0deg, rgba(83,74,183,0) 0deg, rgba(83,74,183,.05) 110deg, #534AB7 296deg, #8B7CF6 342deg, rgba(139,124,246,0) 360deg);
+    -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+    mask:radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+    animation:wk-spin 1.5s linear infinite}
+  .wk-arc2{position:absolute;inset:13px;border-radius:50%;border:1px dashed rgba(139,124,246,.42);
+    animation:wk-spin-rev 7s linear infinite}
+  .wk-ring{position:absolute;inset:24px;border-radius:50%;border:1px solid rgba(83,74,183,.18)}
+  .wk-core{position:absolute;left:50%;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:50%;
+    background:radial-gradient(circle, #ffffff 0%, #6B5FD6 46%, rgba(83,74,183,0) 74%);
+    box-shadow:0 0 12px rgba(83,74,183,.55), 0 0 30px rgba(139,124,246,.35);
+    animation:wk-core 1.6s ease-in-out infinite}
+  .wk-dots{position:absolute;inset:0;animation:wk-spin 3.4s linear infinite}
+  .wk-dots i{position:absolute;left:50%;top:-2px;width:5px;height:5px;margin-left:-2.5px;border-radius:50%;
+    background:#8B7CF6;box-shadow:0 0 8px #8B7CF6;animation:wk-dot 1.4s ease-in-out infinite}
+  .wk-dots i:nth-child(2){top:auto;bottom:-2px;animation-delay:.35s;background:#534AB7;box-shadow:0 0 8px #534AB7}
+  .wk-dots i:nth-child(3){left:-2px;top:50%;margin:-2.5px 0 0 0;animation-delay:.7s;background:#4FBFA8;box-shadow:0 0 8px #4FBFA8}
+  @keyframes wk-spin{to{transform:rotate(360deg)}}
+  @keyframes wk-spin-rev{to{transform:rotate(-360deg)}}
+  @keyframes wk-core{0%,100%{transform:scale(.82);opacity:.6}50%{transform:scale(1.12);opacity:1}}
+  @keyframes wk-halo{0%,100%{opacity:.45;transform:scale(.96)}50%{opacity:.9;transform:scale(1.04)}}
+  @keyframes wk-dot{0%,100%{opacity:.25}50%{opacity:1}}
+  @keyframes wkb{0%{margin-left:-40%}100%{margin-left:100%}}
+  .wk-bar{height:4px;border-radius:999px;background:rgba(127,127,127,.18);overflow:hidden;margin:16px 0 8px}
+  .wk-bar > i{display:block;height:100%;width:40%;border-radius:999px;
+    background:linear-gradient(90deg, rgba(83,74,183,0), #534AB7 45%, #8B7CF6 70%, rgba(83,74,183,0));
+    animation:wkb 1.6s ease-in-out infinite}
+  .wk-label{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.16em;
+    color:#8a8f98;text-transform:uppercase;margin-bottom:10px}
+  .wk-step{font-size:13px;color:#8a8f98;min-height:20px;text-align:center}
+  .wk-acts{margin-top:16px;text-align:center}
+  .wk-note{margin-top:14px;font-size:12px;line-height:1.7;color:#8a8f98;text-align:center}
+  @media (prefers-reduced-motion: reduce){
+    .wk-arc,.wk-arc2,.wk-dots,.wk-dots i,.wk-core,.wk-halo,.wk-bar > i{animation:none!important}
+  }
+</style>
+</head>
+<body>
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">
+    <div class="card" style="max-width:420px;width:100%;text-align:center">
+      <div class="wk-orb" id="spin">
+        <div class="wk-halo"></div><div class="wk-arc"></div><div class="wk-arc2"></div>
+        <div class="wk-ring"></div><div class="wk-core"></div>
+        <div class="wk-dots"><i></i><i></i><i></i></div>
+      </div>
+      <h1 class="page-title" style="margin-bottom:6px">正在启动你的工作区…</h1>
+      <p class="page-sub" style="margin-bottom:0">空闲一段时间后实例会被回收，首次访问需要几秒重新拉起。</p>
+      <div class="wk-bar"><i></i></div>
+      <div class="wk-step" id="step">正在连接…</div>
+      <div class="wk-label">dsh · auto recovery</div>
+      <div class="wk-acts" id="acts" style="display:none">
+        <button class="btn primary" id="retry">重试</button>
+      </div>
+      <p class="wk-note" id="note">
+        若长时间无反应，可点「重试」。本页会自动跳转，无需手动刷新。
+      </p>
+    </div>
+  </div>
+<script>
+(function () {
+  var NEXT = new URLSearchParams(location.search).get('next') || ''
+  var step = document.getElementById('step')
+  var acts = document.getElementById('acts')
+  var note = document.getElementById('note')
+  var tried = 0
+  var MAX = 3
+
+  function show(text) { step.textContent = text }
+
+  function fail(msg) {
+    document.getElementById('spin').style.display = 'none'
+    acts.style.display = 'block'
+    note.textContent = msg
+    show('启动失败')
+  }
+
+  // 只允许跳回本站（同一注册域）的子域，避免被 next 参数带偏
+  function safeNext(u) {
+    try { var x = new URL(u, location.href); var p = location.hostname.split('.'); var base = p.length > 2 ? p.slice(1).join('.') : location.hostname; return (x.hostname === location.hostname || x.hostname.slice(-(base.length + 1)) === '.' + base) ? x.href : '' } catch (e) { return '' }
+  }
+
+  async function wake() {
+    tried += 1
+    show(tried === 1 ? '正在拉起实例（第 1 次，通常 5–15 秒）…' : '正在重试（第 ' + tried + ' 次）…')
+    try {
+      // 复用平台已有的登录直达接口：它内部会 launch（实例不在则拉起）并返回带 token 的直达 URL
+      var res = await fetch('/api/dsh/enter', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      if (res.status === 401) { location.replace('/login.html'); return }
+      var j = await res.json().catch(function () { return {} })
+      var url = j.url || j.redirect || ''
+      if (res.ok && url) {
+        show('已就绪，正在跳转…')
+        location.replace(url)
+        return
+      }
+      if (res.ok && !url) {                 // 已登录但需要重走门户
+        location.replace('/portal.html')
+        return
+      }
+      if (j.error === 'instance_circuit_open') {   // 被熔断冷却，重试没有意义
+        var waitMin = Math.max(1, Math.ceil((j.retryAfterMs || 0) / 60000))
+        fail('实例连续崩溃，平台已暂停自动拉起（约 ' + waitMin + ' 分钟后可重试）。若反复出现，请联系管理员查看维护日志。')
+        return
+      }
+      throw new Error(j.error || ('HTTP ' + res.status))
+    } catch (err) {
+      if (tried < MAX) {
+        show('未就绪，2 秒后自动重试…')
+        setTimeout(wake, 2000)
+      } else {
+        fail('多次尝试仍未就绪：' + (err && err.message ? err.message : '未知错误'))
+      }
+    }
+  }
+
+  document.getElementById('retry').addEventListener('click', function () {
+    tried = 0
+    document.getElementById('spin').style.display = ''
+    acts.style.display = 'none'
+    note.textContent = '本页会自动跳转，无需手动刷新。'
+    wake()
+  })
+
+  // 若 nginx 带了 next（原始目标地址），唤醒后优先回那里
+  var saved = safeNext(NEXT)
+  if (saved) { sessionStorage.setItem('dsh.wake.next', saved) }
+
+  var t = setInterval(function () {
+    var n = sessionStorage.getItem('dsh.wake.next')
+    if (n && n !== NEXT) {
+      clearInterval(t)
+      // 直接以原始目标为跳转终点（进入后再由实例侧校验 token）
+      NEXT = n
+    }
+  }, 1000)
+  setTimeout(function () { clearInterval(t) }, 30000)
+
+  wake()
+})()
+</script>
+</body>
+</html>

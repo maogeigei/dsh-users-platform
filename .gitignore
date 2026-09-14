@@ -1,0 +1,13 @@
+node_modules/
+lib/
+data/
+dist-web/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.local.db
+.DS_Store
+
+# 改码前的就地备份（不应入库）
+*.bak-*
