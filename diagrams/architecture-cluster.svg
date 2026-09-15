@@ -52,7 +52,7 @@
     <!-- the lease, highlighted -->
     <rect x="64" y="382" width="684" height="58" rx="8" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.6"/>
     <text class="t chip" x="80" y="404" fill="#7a5c00">Ownership lease — one live instance per user, across hosts</text>
-    <text class="t lbl" x="80" y="425">atomic claim in Postgres · TTL &gt; 2 × renew interval · every write carries an epoch</text>
+    <text class="t lbl" x="80" y="425">atomic claim in Postgres · renewed on a TTL · every write carries an epoch</text>
 
     <rect x="760" y="382" width="356" height="58" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
     <text class="t chip" x="776" y="404">Shared database</text>
@@ -90,7 +90,7 @@
 
     <!-- cross-cutting -->
     <rect x="40" y="696" width="1100" height="48" rx="10" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5"/>
-    <text class="t chip" x="64" y="718">Protocol discipline — workers only dial in · one idempotency key per operation · a worker that loses its epoch stops its own instance</text>
-    <text class="t lbl" x="64" y="736">hosts agree on the same data root, and a mismatch is reported at startup rather than at the first request</text>
+    <text class="t chip" x="64" y="718">Protocol discipline — workers dial in to the manager · one idempotency key per operation · the manager is the only writer of ownership</text>
+    <text class="t lbl" x="64" y="736">every host uses the same absolute data root, so an instance keeps the same paths wherever it runs</text>
   </g>
 </svg>

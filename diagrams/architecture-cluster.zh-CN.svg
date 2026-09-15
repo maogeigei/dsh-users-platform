@@ -52,7 +52,7 @@
     <!-- 归属租约（高亮） -->
     <rect x="64" y="382" width="684" height="58" rx="8" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.6"/>
     <text class="t chip" x="80" y="404" fill="#7a5c00">归属租约 —— 跨主机保证「一个用户同时只有一个活实例」</text>
-    <text class="t lbl" x="80" y="425">在 Postgres 里原子抢占 · TTL &gt; 2 × 续租间隔 · 每次写入都带 epoch</text>
+    <text class="t lbl" x="80" y="425">在 Postgres 里原子抢占 · 按 TTL 定时续租 · 每次写入都带 epoch</text>
 
     <rect x="760" y="382" width="356" height="58" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
     <text class="t chip" x="776" y="404">共享数据库</text>
@@ -90,7 +90,7 @@
 
     <!-- 跨层 -->
     <rect x="40" y="696" width="1100" height="48" rx="10" fill="#fff8c5" stroke="#d4a72c" stroke-width="1.5"/>
-    <text class="t chip" x="64" y="718">协议纪律 —— 工作节点只拨入不反连 · 每次操作一个幂等键 · 失去 epoch 的节点主动停掉自己的实例</text>
-    <text class="t lbl" x="64" y="736">各工作节点的数据根必须一致；不一致时在**启动阶段**报出来，而不是等到第一次请求</text>
+    <text class="t chip" x="64" y="718">协议纪律 —— 工作节点向管理节点拨入 · 每次操作一个幂等键 · 归属只由管理节点写入</text>
+    <text class="t lbl" x="64" y="736">各主机使用同一个绝对数据根，实例在任何一台机器上路径含义一致</text>
   </g>
 </svg>

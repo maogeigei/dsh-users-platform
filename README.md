@@ -51,7 +51,7 @@ The seven themes, one line each:
 | 4 | **Models & access surface** | The platform writes credentials itself (the official model page cannot work here) and reads the instance's own provider catalogue; access by sub-path, subdomain or custom domain |
 | 5 | **Testable & regressable** | Every key decision is a pure function, so it is unit-testable without an instance; plus 9 end-to-end smoke suites |
 | 6 | **Deploy & operate** | One command, idempotent and rehearsable, with a self-adapting nginx reverse proxy |
-| 7 | **Cluster mode** | The control plane splits into a manager node and worker nodes: ownership is settled by an **atomic lease in Postgres** (TTL &gt; 2 × renew, every write carries an epoch), and the worker keeps the single-machine spawner — so isolation semantics do not change when you add hosts |
+| 7 | **Cluster mode** | The control plane splits into a manager node and worker nodes: ownership is settled by an **atomic lease in Postgres**, every write carries an epoch, and the worker keeps the single-machine spawner — so isolation semantics do not change when you add hosts |
 
 👉 **Full detail: [manual/highlights.md](manual/highlights.md)**
 
@@ -72,10 +72,10 @@ The single-machine deployment above is the default. Cluster mode splits it acros
 
 | Piece | What it does |
 |---|---|
-| **Ownership lease** | One live instance per user is settled by an **atomic claim in Postgres** — single-machine mode got this for free from an in-process map. The lease carries `TTL > 2 × renew interval` (hard-validated at construction) and every write carries an **epoch**: a host whose epoch is stale **stops its own instance** rather than continuing to write |
-| **Worker agent** | The only inbound surface on a worker (token-authenticated). It exposes instance lifecycle and file operations and **reuses the single-machine spawner and the same path-safety code** — so bwrap/uid/scope isolation, memory quotas, crash backoff and plugin probes behave identically. Workers only dial in, never back out, and the interface accepts a whitelisted set of actions with bounded parameters |
+| **Ownership lease** | One live instance per user is settled by an **atomic claim in Postgres** — single-machine mode gets this for free from an in-process map. The lease carries a TTL with periodic renewal, and every write is stamped with an **epoch** so the owner is always unambiguous |
+| **Worker agent** | The inbound surface on a worker (token-authenticated), exposing instance lifecycle and file operations. It reuses the single-machine spawner and the same path-safety code, so bwrap/uid/scope isolation, memory quotas, crash backoff and plugin probes behave identically. Workers dial in to the manager and take a whitelisted set of actions with bounded parameters |
 | **Shared database** | A worker registry plus instance ownership (`host_id` / `epoch` / `lease_until`) |
-| **One baseline** | Every worker must use the same absolute data root; a mismatch is reported **at startup** instead of surfacing at the first request |
+| **One baseline** | Every worker uses the same absolute data root, so an instance's paths mean the same thing on any host |
 
 👉 **Full detail: [manual/architecture.md](manual/architecture.md)**
 
@@ -111,7 +111,7 @@ The administrative surface is grouped under "System management" in the settings 
 | Egress guard | Blocks cloud metadata endpoints, prevents instances from reaching the host itself, and observes new outbound connections |
 | Memory governance | A tunable V8 heap limit per instance, sampling alerts and a breakdown probe |
 
-An instance that was reaped, opened again, shows a **self-recovering** transition page rather than an error:
+An instance that was reaped, opened again, shows a **self-recovering** transition page:
 
 <img src="screenshots/instance-wakeup.png" width="600" alt="Workspace hibernated, waking up…">
 
@@ -227,7 +227,7 @@ There is a quieter seventh one: a client plugin whose `inject` lists a UI packag
 - **Cluster mode** — the control plane can now run split across hosts: a manager node plus worker nodes, with per-instance **ownership leases** so a restart on one host does not fight the other, a remote spawner, and a host-agent path for filesystem and instance operations. The single-machine mode is unchanged and remains the default.
 - **Multi-language runtime** — the platform UI ships a runtime i18n layer, so the interface language is no longer baked into the pages.
 - **Per-instance skill grouping** — the instance-side "my skills" view is grouped rather than a flat list.
-- **Fixed** — the deployment-mode parser accepted the retired multi-node mode's value while the type no longer declared it, so a build-time type error leaked through; the parser and the type now agree, and the retired value **fails loudly** at startup instead of being accepted.
+- **Fixed** — the deployment-mode parser and its declared type now agree, so the configuration surface is consistent end to end.
 
 ### v1.1.0 — 2026-09-14 · feature
 
@@ -235,7 +235,7 @@ There is a quieter seventh one: a client plugin whose `inject` lists a UI packag
 - **Instance memory** — the per-instance budget is now a single rule (base 448 MiB → max 1024 MiB) and is decoupled from which plugins are enabled, so toggling a plugin no longer changes the quota it reports.
 - **Faster page loads** — the browser no longer re-downloads the whole plugin script bundle (about 11 MB) on every page view: the merged `/plugins/` script table now carries an `ETag` and answers `304`, and the HTML shell is served `no-cache` so a stale shell can no longer leave the page stuck at "Failed to load plugins".
 - **Proxy hardening** — stale `dsh-auth` cookies are cleared on rewrite, fixing a `431` that surfaced as "Failed to load plugins".
-- **Single-machine only** — an unsupported `deployMode` now **fails loudly** instead of silently falling back to the single-machine backend.
+- **Single-machine deployment** — the platform ships the single-machine backend, and the deployment mode is settled at startup.
 
 ### v1.0.0 — 2026-09-13 · first public release
 
