@@ -14,7 +14,7 @@ import { join } from 'node:path'
 export type IsolationMode = 'soft' | 'account'
 
 /** Deployment mode: a single host running per-user child processes (setuid/iptables). */
-export type DeployMode = 'local'
+export type DeployMode = 'local' | 'cluster'
 
 /** Resolved, immutable runtime configuration. */
 export interface ServerConfig {
@@ -80,6 +80,21 @@ export interface ServerConfig {
   encryptionSecret: string
   /** Deployment mode (see {@link DeployMode}). */
   deployMode: DeployMode
+  // ── cluster 模式（T08 S3/S4；设计 §1.1）────────────────────────────────
+  /** 本机在 `dsh_hosts.id` 里的标识（`deployMode=cluster` 时必填语义）。 */
+  clusterHostId: string
+  /** 本机 worker agent 的**基址**（Manager 侧用它投递实例操作），如 `http://127.0.0.1:9000`。 */
+  clusterAgentUrl: string
+  /** 与 agent 约定的共享密钥（仅内网 + nft 白名单）。 */
+  clusterAgentToken: string
+  /** agent 返回给 Manager 做代理的实例地址（同机 1a = `127.0.0.1`）。 */
+  clusterInstanceHost: string
+  /**
+   * **worker 上**的 dataRoot（T08 S5）。
+   * 空 = 与本地 `dataRoot` 相同（1a 形态）。多机部署必须显式配置 —— 而且是**基线约定**：
+   * 所有 worker 的 dataRoot 必须是同一个绝对路径（同镜像即可满足，设计 §14.3）。
+   */
+  clusterWorkerDataRoot: string
 }
 
 /** Untyped overrides collected from argv / env. */
@@ -114,6 +129,11 @@ export interface ConfigOverrides {
   idleReapIntervalSeconds?: number | string
   encryptionSecret?: string
   deployMode?: DeployMode | string
+  clusterHostId?: string
+  clusterAgentUrl?: string
+  clusterAgentToken?: string
+  clusterInstanceHost?: string
+  clusterWorkerDataRoot?: string
 }
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -192,8 +212,8 @@ function toIsolationMode(value: string | undefined): IsolationMode | undefined {
 function toDeployMode(value: string | undefined): DeployMode | undefined {
   if (value === undefined) return undefined
   const normalized = value.trim().toLowerCase()
-  if (normalized === 'local') return normalized
-  throw new Error(`invalid deploy mode "${value}" (expected "local")`)
+  if (normalized === 'local' || normalized === 'cluster') return normalized
+  throw new Error(`invalid deploy mode "${value}" (expected "local" or "cluster")`)
 }
 
 /**
@@ -286,5 +306,10 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ServerConfig {
     encryptionSecret:
       overrides.encryptionSecret ?? resolveEncryptionSecret(dataRoot),
     deployMode,
+    clusterHostId: overrides.clusterHostId ?? process.env.DSH_USERS_PLATFORM_CLUSTER_HOST_ID ?? hostname(),
+    clusterAgentUrl: overrides.clusterAgentUrl ?? process.env.DSH_USERS_PLATFORM_CLUSTER_AGENT_URL ?? '',
+    clusterAgentToken: overrides.clusterAgentToken ?? process.env.DSH_USERS_PLATFORM_CLUSTER_AGENT_TOKEN ?? '',
+    clusterInstanceHost: overrides.clusterInstanceHost ?? process.env.DSH_USERS_PLATFORM_CLUSTER_INSTANCE_HOST ?? '127.0.0.1',
+    clusterWorkerDataRoot: overrides.clusterWorkerDataRoot ?? process.env.DSH_USERS_PLATFORM_CLUSTER_WORKER_DATA_ROOT ?? '',
   }
 }

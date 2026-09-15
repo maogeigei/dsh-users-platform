@@ -5,7 +5,7 @@
 Securely **host** [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) on the public internet: users self-register, an admin approves them, and each one gets a **dedicated instance** plus a private file root.
 
 [![Node](https://img.shields.io/badge/node-%5E22.19%20%7C%20%3E%3D24-339933.svg)](https://nodejs.org/)
-[![Version](https://img.shields.io/badge/version-v1.1.0-informational.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.2.0-informational.svg)](#version-history)
 [![DeepSeek Harness](https://img.shields.io/badge/built%20on-DeepSeek%20Harness-4D6BFE.svg)](https://github.com/deepseek-ai/deepseek-harness)
 [![AI-generated](https://img.shields.io/badge/code%20%26%20docs-AI--generated-8A2BE2.svg)](manual/project.md#ai-generation)
 [![Built with](https://img.shields.io/badge/DeepSeek%20V4%20%2F%20V4.1%20flash-2F6FED.svg)](manual/project.md#ai-generation)
@@ -41,7 +41,7 @@ Every document has a Chinese counterpart (`*.zh-CN.md`).
 
 ## Highlights
 
-The six themes, one line each:
+The seven themes, one line each:
 
 | # | Theme | In one line |
 |---|---|---|
@@ -51,6 +51,7 @@ The six themes, one line each:
 | 4 | **Models & access surface** | The platform writes credentials itself (the official model page cannot work here) and reads the instance's own provider catalogue; access by sub-path, subdomain or custom domain |
 | 5 | **Testable & regressable** | Every key decision is a pure function, so it is unit-testable without an instance; plus 9 end-to-end smoke suites |
 | 6 | **Deploy & operate** | One command, idempotent and rehearsable, with a self-adapting nginx reverse proxy |
+| 7 | **Cluster mode** | The control plane splits into a manager node and worker nodes: ownership is settled by an **atomic lease in Postgres** (TTL &gt; 2 × renew, every write carries an epoch), and the worker keeps the single-machine spawner — so isolation semantics do not change when you add hosts |
 
 👉 **Full detail: [manual/highlights.md](manual/highlights.md)**
 
@@ -62,6 +63,19 @@ The base is [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 
 
 **Request path**: browser → nginx (TLS) → control plane (auth / approval / admin / web desktop) → routed by `Host` or `/u/<userId>/dsh/*` → the user instance (loopback only).
 **Self-healing**: a crash → spawn a guardian once to repair the profile → restart; repeated crashes back off and trip a circuit-breaker.
+
+### Cluster mode
+
+<img src="diagrams/architecture-cluster.svg" width="100%" alt="Cluster architecture: browser → nginx → manager node (ownership lease + shared database) → worker agent → per-user instances">
+
+The single-machine deployment above is the default. Cluster mode splits it across hosts **without changing what a user gets**:
+
+| Piece | What it does |
+|---|---|
+| **Ownership lease** | One live instance per user is settled by an **atomic claim in Postgres** — single-machine mode got this for free from an in-process map. The lease carries `TTL > 2 × renew interval` (hard-validated at construction) and every write carries an **epoch**: a host whose epoch is stale **stops its own instance** rather than continuing to write |
+| **Worker agent** | The only inbound surface on a worker (token-authenticated). It exposes instance lifecycle and file operations and **reuses the single-machine spawner and the same path-safety code** — so bwrap/uid/scope isolation, memory quotas, crash backoff and plugin probes behave identically. Workers only dial in, never back out, and the interface accepts a whitelisted set of actions with bounded parameters |
+| **Shared database** | A worker registry plus instance ownership (`host_id` / `epoch` / `lease_until`) |
+| **One baseline** | Every worker must use the same absolute data root; a mismatch is reported **at startup** instead of surfacing at the first request |
 
 👉 **Full detail: [manual/architecture.md](manual/architecture.md)**
 
@@ -207,6 +221,13 @@ There is a quieter seventh one: a client plugin whose `inject` lists a UI packag
 📦 **Worked example: [examples/dsh-univer-office/](examples/dsh-univer-office/)** — the porting patch, new modules and companion skill, with the upstream baseline and how to apply it.
 
 ## Version history
+
+### v1.2.0 — 2026-09-15 · feature
+
+- **Cluster mode** — the control plane can now run split across hosts: a manager node plus worker nodes, with per-instance **ownership leases** so a restart on one host does not fight the other, a remote spawner, and a host-agent path for filesystem and instance operations. The single-machine mode is unchanged and remains the default.
+- **Multi-language runtime** — the platform UI ships a runtime i18n layer, so the interface language is no longer baked into the pages.
+- **Per-instance skill grouping** — the instance-side "my skills" view is grouped rather than a flat list.
+- **Fixed** — the deployment-mode parser accepted the retired multi-node mode's value while the type no longer declared it, so a build-time type error leaked through; the parser and the type now agree, and the retired value **fails loudly** at startup instead of being accepted.
 
 ### v1.1.0 — 2026-09-14 · feature
 

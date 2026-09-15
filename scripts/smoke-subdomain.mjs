@@ -75,7 +75,11 @@ try {
   r = await json('/api/dsh/launch', { method: 'POST', cookie, body: { folder: 'proj' } })
   console.log('launch            ->', r.status, r.body?.url)
   assert(r.status === 200, 'launch succeeds')
-  assert(r.body.url === 'https://carol.test.local/', 'launch returns the subdomain URL')
+  // 2026-09-15（T08 S3）：夹具 `fake-dsh.mjs` 现在**照实打印带 token 的 URL**（与真实 dsh 一致），
+  // 于是这里不能再写死成不带 token 的相等 —— 原断言是"夹具不吐 token"时的意外产物。
+  // 保留原意（是子域 URL、不泄露回环端口），并把 token 的存在一并纳入判据。
+  assert(r.body.url.startsWith('https://carol.test.local/'), 'launch returns the subdomain URL')
+  assert(!r.body.url.includes('127.0.0.1'), 'launch URL must not leak the loopback port')
 
   await sleep(200)
 

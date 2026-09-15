@@ -89,6 +89,15 @@ export interface DshInstance {
   folder: string | null
   /** Rendered Cordis patch content (not a path — the control plane holds no user volume). */
   patch: string | null
+  // ── 集群化归属与租约（v7；T08 S2 / 设计 §3.1）—— local 模式下恒为 null/0 ──
+  /** 托管该实例的 worker（`dsh_hosts.id`）；null = 未被任何 worker 认领。 */
+  hostId: string | null
+  /** **fencing token**：每次抢占 +1；旧持有者的写入据此被拒（防脑裂双写）。 */
+  epoch: number
+  /** 最近一次心跳（epoch 毫秒）。 */
+  heartbeatAt: number
+  /** 租约到期时刻（epoch 毫秒）；早于 now 即可被他人抢占。 */
+  leaseUntil: number
 }
 
 /** A named per-user credential key (secret never exposed). */
@@ -261,6 +270,10 @@ export function toDshInstance(row: Record<string, unknown>): DshInstance {
     lastError: (row.last_error as string | null) ?? null,
     folder: (row.folder as string | null) ?? null,
     patch: (row.patch as string | null) ?? null,
+    hostId: (row.host_id as string | null) ?? null,
+    epoch: (row.epoch as number | null) ?? 0,
+    heartbeatAt: (row.heartbeat_at as number | null) ?? 0,
+    leaseUntil: (row.lease_until as number | null) ?? 0,
   }
 }
 
@@ -286,5 +299,66 @@ export function toBusinessPlugin(row: Record<string, unknown>): BusinessPlugin {
     uploadedBy: (row.uploaded_by as string | null) ?? null,
     createdAt: row.created_at as number,
     updatedAt: row.updated_at as number,
+  }
+}
+
+// ── 集群化：worker 注册表与租约结果（v7；T08 S2 / 设计 §3.1–§3.2）──────────────
+
+/** Worker 健康状态（`dsh_hosts.status` 的 CHECK 镜像）。 */
+export type DshHostStatus = 'up' | 'draining' | 'down'
+
+/** 一台承载用户实例的 worker（= 设计里的 Worker 节点）。 */
+export interface DshHost {
+  id: string
+  /** agent 的内网地址，如 `10.0.1.11:9000`。 */
+  endpoint: string
+  /** 内部 HMAC 密钥（**只应存在于 DB 与 Manager 内存**，绝不经 API 返回）。 */
+  agentToken: string
+  /** 该机可用内存预算（MB）；0 = 不承载实例（只做门户/控制）。 */
+  capacityMb: number
+  /** 由心跳上报的已用内存（MB）。 */
+  usedMb: number
+  status: DshHostStatus
+  /** 最近心跳（epoch 毫秒）；null = 从未上报。 */
+  lastHeartbeat: number | null
+}
+
+/** Upsert payload for `dsh_hosts`（join 脚本/管理面用）。 */
+export interface UpsertDshHostInput {
+  id: string
+  endpoint: string
+  agentToken: string
+  capacityMb: number
+  status?: DshHostStatus
+}
+
+/**
+ * 抢占结果。`ok:false` 时带回**当前持有者**与租约到期时刻，便于调用方决定
+ * "退让"还是"报告异常"（**不要据此接管** —— 见项目红线 R9）。
+ */
+export type ClaimResult =
+  | { ok: true; epoch: number; leaseUntil: number }
+  | { ok: false; holder: string | null; leaseUntil: number }
+
+/**
+ * 集群模式下 main 实例行的**确定性 id**。
+ *
+ * 为什么需要确定性：租约是以 **(user, role='main')** 为单位的，`dsh_instances.id` 只是载体；
+ * 若每次 spawn 用随机 id，抢占时会插出多行 ⇒ 归属判断失效。local 模式仍用随机 id
+ * （它不写库），集群路径一律走这里。
+ */
+export function clusterInstanceId(userId: string): string {
+  return `dsh-${userId}`
+}
+
+export function toDshHost(row: Record<string, unknown>): DshHost {
+  return {
+    id: row.id as string,
+    endpoint: row.endpoint as string,
+    agentToken: row.agent_token as string,
+    capacityMb: (row.capacity_mb as number | null) ?? 0,
+    usedMb: (row.used_mb as number | null) ?? 0,
+    status: row.status as DshHostStatus,
+    lastHeartbeat: (row.last_heartbeat as number | null) ?? null,
   }
 }

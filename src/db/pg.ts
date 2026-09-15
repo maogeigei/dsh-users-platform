@@ -11,20 +11,25 @@ import type { DbAdapter } from './adapter.js'
 import { mapPgError } from './errors.js'
 import { runPgMigrations } from './schema.js'
 import {
+  clusterInstanceId,
   toBusinessPlugin,
   toDomain,
+  toDshHost,
   toDshInstance,
   toPublicUser,
   toSession,
   toUser,
   toWorkspace,
   type BusinessPlugin,
+  type ClaimResult,
   type CredentialKey,
   type CredentialKeyMeta,
   type CredentialLandingRow,
   type CreateSessionInput,
   type CreateUserInput,
   type Domain,
+  type DshHost,
+  type DshHostStatus,
   type DshInstance,
   type DshInstanceRole,
   type DshInstanceStatus,
@@ -32,6 +37,7 @@ import {
   type SessionRow,
   type SessionUser,
   type UpsertBusinessPluginInput,
+  type UpsertDshHostInput,
   type UpsertDshInstanceInput,
   type User,
   type UserRole,
@@ -47,8 +53,10 @@ types.setTypeParser(20, (value: string) => Number(value))
 const USER_COLS = 'id, username, pass_hash, role, home_dir, api_key_ref, created_at, approved_by, uid'
 const DOMAIN_COLS = 'id, user_id, domain, verified, nginx_config, updated_at'
 const BUSINESS_PLUGIN_COLS = 'id, name, description, version, tgz_path, file_size, uploaded_by, created_at, updated_at'
+const HOST_COLS = 'id, endpoint, agent_token, capacity_mb, used_mb, status, last_heartbeat'
 const INSTANCE_COLS =
-  'id, user_id, workspace_id, role, pid, port, status, started_at, last_exit, exit_code, last_error, folder, patch'
+  'id, user_id, workspace_id, role, pid, port, status, started_at, last_exit, exit_code, last_error, folder, patch, '
+  + 'host_id, epoch, heartbeat_at, lease_until' // v7 集群化归属/租约（T08 S2）—— 漏了它们会让 hostId 恒为 null
 
 /** Run `fn` on a dedicated client inside a BEGIN/COMMIT/ROLLBACK transaction. */
 export async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -585,6 +593,153 @@ export class PgAdapter implements DbAdapter {
 
   async deleteUserInstances(userId: string): Promise<void> {
     await this.pool.query('DELETE FROM dsh_instances WHERE user_id = $1', [userId])
+  }
+
+  // ── 集群化：worker 注册表 + 归属/租约（v7；T08 S2 / 设计 §3.1–§3.2）────────
+  // 与 `repo.ts` 的同名 SQLite 实现**逐条对齐**（两套实现并存是本库既有事实，
+  // 见）：任何 schema/语义变更都要**两侧同改**，否则切库时才炸。
+
+  async upsertDshHost(input: UpsertDshHostInput): Promise<DshHost> {
+    try {
+      const { rows } = await this.pool.query(
+        `INSERT INTO dsh_hosts (id, endpoint, agent_token, capacity_mb, used_mb, status, last_heartbeat)
+         VALUES ($1, $2, $3, $4, 0, $5, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           endpoint    = excluded.endpoint,
+           agent_token = excluded.agent_token,
+           capacity_mb = excluded.capacity_mb,
+           status      = excluded.status
+         RETURNING id, endpoint, agent_token, capacity_mb, used_mb, status, last_heartbeat`,
+        [input.id, input.endpoint, input.agentToken, input.capacityMb, input.status ?? 'up'],
+      )
+      return toDshHost(rows[0] as Record<string, unknown>)
+    } catch (e) {
+      mapPgError(e)
+    }
+  }
+
+  async findDshHost(id: string): Promise<DshHost | undefined> {
+    const { rows } = await this.pool.query(
+      `SELECT ${HOST_COLS} FROM dsh_hosts WHERE id = $1`,
+      [id],
+    )
+    return rows.length > 0 ? toDshHost(rows[0] as Record<string, unknown>) : undefined
+  }
+
+  async listDshHosts(): Promise<DshHost[]> {
+    const { rows } = await this.pool.query(`SELECT ${HOST_COLS} FROM dsh_hosts ORDER BY id ASC`)
+    return rows.map((row) => toDshHost(row as Record<string, unknown>))
+  }
+
+  async setDshHostStatus(
+    id: string,
+    status: DshHostStatus,
+    usedMb?: number,
+    heartbeatAt?: number,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE dsh_hosts
+          SET status = $1,
+              used_mb = COALESCE($2, used_mb),
+              last_heartbeat = COALESCE($3, last_heartbeat)
+        WHERE id = $4`,
+      [status, usedMb ?? null, heartbeatAt ?? null, id],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * **原子抢占**（承重墙）：PG 侧用 `UPDATE … RETURNING` —— 只有真正更新到行才返回行，
+   * 比"先读后写"少一次竞态窗口（SQLite 侧用 `changes` 判定，语义等价）。
+   */
+  async claimInstance(
+    userId: string,
+    hostId: string,
+    ttlMs: number,
+    meta?: { folder?: string; patch?: string },
+  ): Promise<ClaimResult> {
+    const now = Date.now()
+    const id = clusterInstanceId(userId)
+    await this.pool.query(
+      `INSERT INTO dsh_instances (id, user_id, role, status) VALUES ($1, $2, 'main', 'starting')
+       ON CONFLICT(id) DO NOTHING`,
+      [id, userId],
+    )
+    // folder/patch 一起落库：迁移要能复现启动参数（见 repo.ts 同名处注释）
+    const res = await this.pool.query(
+      `UPDATE dsh_instances
+          SET host_id = $1, epoch = epoch + 1, heartbeat_at = $2, lease_until = $3,
+              folder = COALESCE($4, folder), patch = COALESCE($5, patch)
+        WHERE id = $6 AND (host_id IS NULL OR lease_until < $2)
+        RETURNING epoch, lease_until`,
+      [hostId, now, now + ttlMs, meta?.folder ?? null, meta?.patch ?? null, id],
+    )
+    if (res.rows.length > 0) {
+      const row = res.rows[0] as { epoch: number; lease_until: number }
+      return { ok: true, epoch: row.epoch, leaseUntil: row.lease_until }
+    }
+    const cur = await this.pool.query('SELECT host_id, lease_until FROM dsh_instances WHERE id = $1', [id])
+    const row = cur.rows[0] as { host_id: string | null; lease_until: number } | undefined
+    return { ok: false, holder: row?.host_id ?? null, leaseUntil: row?.lease_until ?? 0 }
+  }
+
+  async renewInstanceLease(
+    userId: string,
+    hostId: string,
+    epoch: number,
+    ttlMs: number,
+  ): Promise<boolean> {
+    const now = Date.now()
+    const result = await this.pool.query(
+      `UPDATE dsh_instances SET heartbeat_at = $1, lease_until = $2
+        WHERE id = $3 AND host_id = $4 AND epoch = $5`,
+      [now, now + ttlMs, clusterInstanceId(userId), hostId, epoch],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /** 只清租约、**保留 host_id**（见 repo.ts 同名函数的长注释）。 */
+  async releaseInstanceLease(userId: string, hostId: string, epoch: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE dsh_instances SET lease_until = 0
+        WHERE id = $1 AND host_id = $2 AND epoch = $3`,
+      [clusterInstanceId(userId), hostId, epoch],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /** 钉住归属（首次触达工作区时用）：只写 host_id。 */
+  async pinInstanceHost(userId: string, hostId: string): Promise<void> {
+    const now = Date.now()
+    const id = clusterInstanceId(userId)
+    await this.pool.query(
+      `INSERT INTO dsh_instances (id, user_id, role, status, host_id, epoch, heartbeat_at, lease_until)
+       VALUES ($1, $2, 'main', 'stopped', $3, 0, 0, 0)
+       ON CONFLICT(id) DO NOTHING`,
+      [id, userId, hostId],
+    )
+    await this.pool.query(
+      `UPDATE dsh_instances SET host_id = $1 WHERE id = $2 AND (host_id IS NULL OR lease_until < $3)`,
+      [hostId, id, now],
+    )
+  }
+
+  async listExpiredInstanceLeases(now: number): Promise<DshInstance[]> {
+    const { rows } = await this.pool.query(
+      `SELECT ${INSTANCE_COLS} FROM dsh_instances
+        WHERE role = 'main' AND host_id IS NOT NULL AND lease_until < $1 AND status <> 'stopped'
+        ORDER BY lease_until ASC`,
+      [now],
+    )
+    return rows.map((row) => toDshInstance(row as Record<string, unknown>))
+  }
+
+  async listInstancesByHost(hostId: string): Promise<DshInstance[]> {
+    const { rows } = await this.pool.query(
+      `SELECT ${INSTANCE_COLS} FROM dsh_instances WHERE host_id = $1 ORDER BY user_id ASC`,
+      [hostId],
+    )
+    return rows.map((row) => toDshInstance(row as Record<string, unknown>))
   }
 
   async close(): Promise<void> {

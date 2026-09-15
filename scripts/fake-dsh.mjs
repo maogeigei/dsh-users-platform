@@ -54,5 +54,10 @@ if (role === 'watchdog') {
   })
   server.listen(port, '127.0.0.1', () => {
     console.log(`fake-dsh listening on ${port}`)
+    // 真实 dsh 启动后会打印**可直达的带 token URL**，平台就是靠这行取 launch token
+    // （正则：/dsh web: http://////127//.0//.0//.1://d+/////?token=([A-Za-z0-9_-]+)/）。
+    // 夹具必须照实吐出来，否则平台只能等满 10 s 超时 ⇒ 「登录直达会话」这条链路
+    // 在本机测试里**永远测不到**（2026-09-15 T08 S3 实测踩到）。
+    console.log(`dsh web: http://127.0.0.1:${port}/?token=FAKE_TOKEN_${process.pid}`)
   })
 }

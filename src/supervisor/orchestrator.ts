@@ -22,7 +22,7 @@ import {
   realpathSync,
   writeFileSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { ServerConfig } from '../config.js'
 import { handoffPath, homeRoot, userRoot, workspaceRoot } from '../fs/workspace.js'
 import {
@@ -128,6 +128,47 @@ function withHeap(base: string | undefined, memMb: number): string {
   return rest.join(' ')
 }
 
+
+/**
+ * 列出 `dest` 与 `stopAt` 之间的**祖先目录**（由外到内），用于 bwrap 的 `--tmpfs`（见
+ * {@link mountParentDirArgs}：`--tmpfs` 自带 0755，且**兼容 47 上的 bwrap 0.4.0**）。
+ *
+ * 背景（T08 S1.6，2026-09-15 实测）：bwrap **只创建挂载点本身**，沿途缺失的父目录由它自建，
+ * 而权限是 **`0700 root:root`** —— 实测 `--bind /opt/a/b/c /opt/a/b/c` 会得到 `/opt`、
+ * `/opt/a`、`/opt/a/b` **全是 0700**。后果：**实例以非 root 的 uid 穿越这些路径时 EACCES**。
+ * 已实测到的两处症状：
+ *   ① 宿主上 `/etc/ssl/openssl.cnf` 是指向 `/etc/pki/tls/openssl.cnf` 的**符号链接** ⇒ 解析要穿过
+ *      `/etc/pki`（0700）⇒ node 报 `OpenSSL configuration error … Permission denied`、**exitCode 13**
+ *      （106 / OpenCloudOS 9.6 实测；47 上**没有**该文件故静默跳过 ⇒ 同一份代码一台能跑一台崩）；
+ *   ② **用户工作区在沙箱内不可穿越** ⇒ 实例按**绝对路径**读写自己的文件被拒。
+ * 修法：把这些祖先目录**显式建成 0755**。**权限不扩大** —— 这些目录里只有随后绑定的白名单内容
+ * （整绑 `/etc/pki` 的替代方案已否决：会带入 `/etc/pki/tls/private/postfix.key`，违反 R5）。
+ */
+function mountParentDirList(dest: string, stopAt: string): string[] {
+  const dirs: string[] = []
+  let cur = dirname(dest)
+  while (cur !== stopAt && cur !== '/' && cur !== '' && cur !== '.') {
+    dirs.push(cur)
+    cur = dirname(cur)
+  }
+  return dirs.reverse() // 由外到内（`--perms` 只作用于紧接着的那一个 `--dir`）
+}
+
+/**
+ * 把 {@link mountParentDirList} 的结果摊平成 bwrap 参数。
+ * ⚠️ **不要再"就近调用"它**（例如插在 `--bind` 之前）—— 见 `bwrapArgs` 里"统一前置"
+ * 那段注释：就近创建会在嵌套前缀下遮掉已绑好的挂载点。当前实现只在**一处**统一使用。
+ */
+function mountParentDirArgs(dest: string, stopAt: string): string[] {
+  // ⚠️ **必须用 `--tmpfs`，不能用 `--perms 0755 --dir`**（2026-09-15 实测，差点打断生产）：
+  //   · `--perms` 是 bubblewrap **0.5+** 才有的选项；**47 上是 0.4.0** ⇒ 传了直接
+  //     `bwrap: Unknown option --perms` ⇒ **沙箱起不来 = 所有实例全挂**（106 是 0.11.0，能过）。
+  //   · 而 `--tmpfs` **自带 0755**（本文件另一处注释也这么写：`bwrap 的 --tmpfs 权限是 755`），
+  //     且在 0.4.0 上就可用。
+  // 47 上实测：改用 `--tmpfs` 后 `/etc` 可见条目 **78 → 78（零变化）**，且 `/etc/pki` 权限
+  // 由 `drwx------` 变为 `drwxr-xr-x`（可穿越）。代价 = 每个中间目录多一个空 tmpfs 挂载（极小）。
+  return mountParentDirList(dest, stopAt).flatMap((d) => ['--tmpfs', d])
+}
 
 /**
  * Local backend: owns the lifecycle of per-user DSH process pairs via
@@ -359,6 +400,26 @@ export class LocalSpawner implements Spawner {
   /** Current main + watchdog for a user. */
   async status(userId: string): Promise<UserStatus> {
     return { main: this.mains.get(userId), watchdog: this.watchdogs.get(userId) }
+  }
+
+  /**
+   * 整机视角的实例清单（T08 S3：worker agent 的 `/instances` 用）。
+   *
+   * 口径 = **每个用户的 main 实例**（watchdog 是一次性 headless，不进对账口径）。
+   * 设计上这是 `/instances` "一次拿回整机"的实现，替代逐用户查询（设计 §11.6）。
+   */
+  listUserInstances(): Instance[] {
+    return [...this.mains.values()]
+  }
+
+  /**
+   * 当前 main 实例的 launch token（T08 S3 P0-6）。
+   *
+   * 本地模式下 token 从子进程 stdout 解析出来；跨机后 **agent 必须把它回传 Manager**，
+   * 否则「登录直达会话」（/13/15）与实例侧 401 自愈（/50/51）都会失效。
+   */
+  launchTokenOf(userId: string): string | undefined {
+    return this.mains.get(userId)?.launchToken
   }
 
   /** Endpoint the proxy forwards to (local → the running main's loopback port). */
@@ -680,6 +741,30 @@ export class LocalSpawner implements Spawner {
           '/etc/ssl',
         ]
         const out: string[] = []
+        // 2026-09-15（T08 S1.6）**中间挂载点必须可穿越（0755）**。
+        //
+        // 现象（106 / OpenCloudOS 9.6 实测）：实例起不来，子进程报
+        //   `/usr/bin/node: OpenSSL configuration error: … Permission denied:
+        //    … fopen(/etc/ssl/openssl.cnf, rb)` ⇒ **exitCode 13**。
+        // 根因：bwrap 会为 `--ro-bind-try /etc/pki/tls/certs …` 这类路径**自动补齐父目录**，
+        //   而这些自动创建的目录权限是 **0700（drwx------ root:root）** ⇒ 非 root 的实例
+        //   **无法穿越**；宿主上 `/etc/ssl/openssl.cnf` 恰好是**指向 `/etc/pki/tls/openssl.cnf`
+        //   的符号链接** ⇒ 解析要穿过 `/etc/pki` → 被拒 → 报 **EACCES（不是 ENOENT）**
+        //   → node 读 OpenSSL 配置**硬失败**。
+        // 为什么 47 没事：Alibaba Cloud Linux 3 上**没有** `/etc/ssl/openssl.cnf`
+        //   ⇒ node 静默跳过 ⇒ **同一份代码一台能跑、一台崩**（机器基线差异，设计 §14.3）。
+        // 修法：在绑定**之前**把白名单路径在 `/etc` 下的所有中间目录显式建成 0755。
+        // 权限**不扩大**：`/etc` 在本沙箱里是 tmpfs，这些目录里只有下面白名单绑定的内容，
+        //   不新增任何宿主可见面。（"整绑 `/etc/pki`"的替代方案已否决 —— 会顺带带入
+        //   `/etc/pki/tls/private/postfix.key`，违反 **R5 权限只准收窄**。）
+        // 注意顺序：由外到内（内层挂载点要求外层已存在）。
+        const intermediates = new Set<string>()
+        for (const p of allow) {
+          for (const d of mountParentDirList(p, '/etc')) intermediates.add(d)
+        }
+        for (const d of [...intermediates].sort((a, b) => a.split('/').length - b.split('/').length)) {
+          out.push('--tmpfs', d) // 见 mountParentDirArgs 的注释：`--tmpfs` 自带 0755 且兼容 bwrap 0.4.0
+        }
         for (const p of allow) {
           let src = p
           try {
@@ -690,6 +775,23 @@ export class LocalSpawner implements Spawner {
           out.push('--ro-bind-try', src, p)
         }
         return out
+      })(),
+      // ── 所有挂载点的**中间目录**统一在这里建好（T08 S1.6 修正版）────────────────
+      // 为什么必须"统一前置 + 去重 + 由外到内"（2026-09-15 实测踩到的真 bug）：
+      //   用户根（`--bind root root`）与共享技能层（`--ro-bind-try skill skill`）**可能嵌套在
+      //   同一前缀下**。若按"就近创建"把技能层的中间目录插在 `--bind root root` **之后**，
+      //   那么后挂的 `--tmpfs <共同祖先>` 会把**已经绑好的用户根整个遮掉** ⇒ bwrap 报
+      //   `Can't chdir to <userRoot>/ws/xxx: No such file or directory` ⇒ 实例崩溃循环。
+      //   前置 + 去重后，中间目录只建一次，后续所有 bind 都落在它里面，谁也不遮谁。
+      // 权限不扩大：这些目录里只有随后绑定的白名单内容。
+      ...(() => {
+        const dirs = new Set<string>()
+        for (const dest of [root, this.config.bundledSkillDir].filter((d) => d !== '')) {
+          for (const d of mountParentDirList(dest, '/')) dirs.add(d)
+        }
+        return [...dirs]
+          .sort((a, b) => a.split('/').length - b.split('/').length)
+          .flatMap((d) => ['--tmpfs', d])
       })(),
       '--dev', '/dev', '--proc', '/proc',
       '--bind', tmpDir, '/tmp',

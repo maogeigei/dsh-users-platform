@@ -16,6 +16,8 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const WEB = join(ROOT, 'web')
 const BANNED = 'dsh-users-platform'          // 用户可见面不得出现的平台内部名
 const WAKE_IDS = ['spin', 'step', 'acts', 'retry', 'note']   // wake.html 内联 JS 依赖的 id
+// R5：已完成多语言迁移的页面（**迁移一页加一个**）。这些页不得再出现裸中文文案。
+const I18N_PAGES = ['login.html', 'register.html', 'wake.html', 'index.html']
 
 let bad = 0
 const pages = readdirSync(WEB).filter((f) => f.endsWith('.html'))
@@ -24,10 +26,26 @@ console.log('=== 静态页不变量（' + pages.length + ' 页）===')
 for (const f of pages) {
   const s = readFileSync(join(WEB, f), 'utf8')
   const problems = []
-  const title = /<title>([^<]*)<\/title>/.exec(s)
+  const title = /<title[^>]*>([^<]*)<\/title>/.exec(s)
   if (!title || title[1].trim() === '') problems.push('缺 <title> 或为空')
   else if (title[1].includes(BANNED)) problems.push('title 含内部平台名: ' + title[1])
   if (s.includes(BANNED)) problems.push('页面正文含内部平台名（去痕迹约束）')
+
+  // R5：**已迁移多语言的页面不得再出现裸中文文案** —— 用户可见文案必须走词条
+  // （`data-i18n` / `I18N.t`）。注释不算文案，故先剥掉 HTML 与 JS 注释再判。
+  // 只对白名单页生效 ⇒ 未迁移页仍允许中文，不会误拦（迁移一页就往 I18N_PAGES 加一个）。
+  if (I18N_PAGES.includes(f)) {
+    const stripped = s
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+      .replace(/[ \t]\/\/[^\n]*/g, '')   // 行尾注释（`code  // 说明`）也要剥（`https://` 不会被误伤：左邻是 `:` 不是空格）
+    const cjk = stripped.split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => /[\u4e00-\u9fa5]/.test(l))
+    if (cjk.length) {
+      problems.push('已迁移多语言但仍有裸中文文案（行 ' + cjk.slice(0, 3).map(([n]) => n).join('/') + '…）')
+    }
+    if (!s.includes('/i18n.js')) problems.push('已迁移多语言但未引入 /i18n.js')
+  }
 
   if (f === 'wake.html') {
     for (const id of WAKE_IDS) {

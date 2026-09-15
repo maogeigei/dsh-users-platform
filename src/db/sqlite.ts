@@ -57,18 +57,32 @@ import {
   setUserRole as setUserRoleSync,
   setUserUid as setUserUidSync,
   toggleCredentialKey as toggleCredentialKeySync,
+  // 集群化（v7；T08 S2）
+  claimInstance as claimInstanceSync,
+  findDshHost as findDshHostSync,
+  listDshHosts as listDshHostsSync,
+  listExpiredInstanceLeases as listExpiredInstanceLeasesSync,
+  listInstancesByHost as listInstancesByHostSync,
+  pinInstanceHost as pinInstanceHostSync,
+  releaseInstanceLease as releaseInstanceLeaseSync,
+  renewInstanceLease as renewInstanceLeaseSync,
+  setDshHostStatus as setDshHostStatusSync,
+  upsertDshHost as upsertDshHostSync,
   upsertBusinessPlugin as upsertBusinessPluginSync,
   upsertDomain as upsertDomainSync,
   upsertInstance as upsertInstanceSync,
 } from './repo.js'
 import type {
   BusinessPlugin,
+  ClaimResult,
   CredentialKey,
   CredentialKeyMeta,
   CredentialLandingRow,
   CreateSessionInput,
   CreateUserInput,
   Domain,
+  DshHost,
+  DshHostStatus,
   DshInstance,
   DshInstanceRole,
   DshInstanceStatus,
@@ -76,6 +90,7 @@ import type {
   SessionRow,
   SessionUser,
   UpsertBusinessPluginInput,
+  UpsertDshHostInput,
   UpsertDshInstanceInput,
   User,
   UserRole,
@@ -319,6 +334,64 @@ export class SqliteAdapter implements DbAdapter {
 
   async deleteUserInstances(userId: string): Promise<void> {
     deleteUserInstancesSync(this.db, userId)
+  }
+
+  // ── 集群化：worker 注册表 + 归属/租约（v7；T08 S2）────────────────────────
+  // local 模式不会走到这些方法（`LocalSpawner` 不写库），它们只是让
+  // **SQLite 侧与 PG 侧行为一致** —— 测试与单机试跑都需要。
+
+  async upsertDshHost(input: UpsertDshHostInput): Promise<DshHost> {
+    try {
+      return upsertDshHostSync(this.db, input)
+    } catch (e) {
+      mapSqliteError(e)
+    }
+  }
+
+  async findDshHost(id: string): Promise<DshHost | undefined> {
+    return findDshHostSync(this.db, id)
+  }
+
+  async listDshHosts(): Promise<DshHost[]> {
+    return listDshHostsSync(this.db)
+  }
+
+  async setDshHostStatus(
+    id: string,
+    status: DshHostStatus,
+    usedMb?: number,
+    heartbeatAt?: number,
+  ): Promise<boolean> {
+    return setDshHostStatusSync(this.db, id, status, usedMb, heartbeatAt)
+  }
+
+  async claimInstance(
+    userId: string,
+    hostId: string,
+    ttlMs: number,
+    meta?: { folder?: string; patch?: string },
+  ): Promise<ClaimResult> {
+    return claimInstanceSync(this.db, userId, hostId, ttlMs, meta)
+  }
+
+  async renewInstanceLease(userId: string, hostId: string, epoch: number, ttlMs: number): Promise<boolean> {
+    return renewInstanceLeaseSync(this.db, userId, hostId, epoch, ttlMs)
+  }
+
+  async releaseInstanceLease(userId: string, hostId: string, epoch: number): Promise<boolean> {
+    return releaseInstanceLeaseSync(this.db, userId, hostId, epoch)
+  }
+
+  async pinInstanceHost(userId: string, hostId: string): Promise<void> {
+    pinInstanceHostSync(this.db, userId, hostId)
+  }
+
+  async listExpiredInstanceLeases(now: number): Promise<DshInstance[]> {
+    return listExpiredInstanceLeasesSync(this.db, now)
+  }
+
+  async listInstancesByHost(hostId: string): Promise<DshInstance[]> {
+    return listInstancesByHostSync(this.db, hostId)
   }
 
   async close(): Promise<void> {

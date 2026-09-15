@@ -156,4 +156,101 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     }
   })
 
+  // ── 集群管理面（T08 S6）：worker 注册表 + 实例迁移 ────────────────────────
+
+  /**
+   * Worker 列表。
+   * ⚠️ **绝不下发 `agentToken`** —— 它是内网共享密钥，只回 `hasToken` 供排查"配没配"。
+   */
+  app.get('/api/admin/hosts', { preHandler: requireAdmin }, async () => {
+    const hosts = await app.db.listDshHosts()
+    return {
+      deployMode: app.config.deployMode,
+      hosts: hosts.map((h) => ({
+        id: h.id,
+        endpoint: h.endpoint,
+        capacityMb: h.capacityMb,
+        usedMb: h.usedMb,
+        status: h.status,
+        lastHeartbeat: h.lastHeartbeat,
+        hasToken: h.agentToken !== '',
+      })),
+    }
+  })
+
+  /** 注册/更新一台 worker（join 脚本调用；**幂等**：同 id 重复执行 = 更新并标回 `up`）。 */
+  app.post('/api/admin/hosts', { preHandler: requireAdmin }, async (request, reply) => {
+    const body = request.body as {
+      id?: string
+      endpoint?: string
+      token?: string
+      capacityMb?: number
+    }
+    if (body.id === undefined || body.endpoint === undefined || body.token === undefined) {
+      return reply.code(400).send({ error: 'id, endpoint and token are required' })
+    }
+    const host = await app.db.upsertDshHost({
+      id: body.id,
+      endpoint: body.endpoint,
+      agentToken: body.token,
+      capacityMb: Number(body.capacityMb ?? 0),
+    })
+    await app.db.audit(request.user?.id ?? null, 'host.upsert', JSON.stringify({ id: host.id, endpoint: host.endpoint }))
+    return {
+      ok: true,
+      host: { id: host.id, endpoint: host.endpoint, capacityMb: host.capacityMb, status: host.status },
+    }
+  })
+
+  /**
+   * **计划内迁移**（T08 S6；设计 §4.2）：drain → 目标机拉起 → 归属原子更新（epoch+1）。
+   *
+   * 顺序不可换：**先停源、再在目标机拉起**。如果反序，两台上会同时有实例（同一个 home ⇒ 双写）。
+   * 归属的原子性由租约保证（`claimInstance` 会把 `host_id` 换成目标机并 `epoch+1`），
+   * 所以旧机即便复活也会被 fencing 挡住（设计 §11.5）。
+   *
+   * ⚠️ **数据不搬家**：`folder` 是实例眼里的绝对路径，能在目标机上生效的前提是
+   * **两台 worker 的 dataRoot 同路径 + 用户数据位置无关**（共享存储或已同步）——
+   * 这正是设计 §12/§14.3 的前提，不是本路由能替你保证的。
+   */
+  app.post('/api/admin/users/:id/dsh/migrate', { preHandler: requireAdmin }, async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const { targetHost } = request.body as { targetHost?: string }
+    if (targetHost === undefined || targetHost === '') {
+      return reply.code(400).send({ error: 'targetHost is required' })
+    }
+    const before = await app.db.findUserInstance(id, 'main')
+    if (before === undefined) return reply.code(404).send({ error: 'not_found', detail: '该用户没有 main 实例记录' })
+    if (before.hostId === targetHost) return reply.code(409).send({ error: 'already_there' })
+
+    const target = await app.db.findDshHost(targetHost)
+    if (target === undefined) return reply.code(404).send({ error: 'unknown_host' })
+    if (target.status === 'down') return reply.code(409).send({ error: 'target_down' })
+
+    const source = before.hostId
+    // fail-loud：没有 folder 就没法在目标机上复现启动（空 cwd 会让 bwrap 直接崩）
+    if ((before.folder ?? '') === '') {
+      return reply.code(409).send({ error: 'no_folder_recorded', detail: '该实例没有记录 folder，无法复现启动' })
+    }
+    // ① drain：停源机实例（优雅停机 → 会话落盘；同时释放归属）
+    if (source !== null) await app.supervisor.stop(id, source)
+    // ② 目标机拉起（走租约：以 targetHost 认领 → epoch+1）
+    const instance = await app.supervisor.launch(id, before.folder ?? '', before.patch ?? undefined, {
+      hostId: targetHost,
+    })
+    const after = await app.db.findUserInstance(id, 'main')
+    await app.db.audit(
+      request.user?.id ?? null,
+      'dsh.migrate',
+      JSON.stringify({ userId: id, from: source, to: after?.hostId, epoch: after?.epoch }),
+    )
+    return {
+      ok: true,
+      from: source,
+      to: after?.hostId ?? null,
+      epoch: after?.epoch ?? 0,
+      port: instance.port ?? null,
+    }
+  })
+
 }

@@ -292,6 +292,59 @@ ALTER TABLE credential_vault ADD COLUMN models TEXT;
 ALTER TABLE users ADD COLUMN shared_model_enabled INTEGER NOT NULL DEFAULT 1;
 `
 
+// v7: 集群化 —— worker 注册表 + 实例归属/租约（T08 S2；设计 §3.1/§3.2）。
+//
+// 为什么需要它：local 模式靠"进程内 Map + 单机"天然保证「一个用户只有一个活实例」；
+// 多机后这个保证必须落到 DB 的**原子 CAS** 上，否则两个 worker 会同时写同一个
+// `$DSH_HOME`（会话日志 append 冲突 ⇒ 数据损坏）。
+//
+//   · `dsh_hosts` = worker 注册表：agent 地址、容量、水位、心跳时间。
+//   · `dsh_instances.{host_id, epoch, heartbeat_at, lease_until}` = 归属与租约。
+//     `epoch` 是 **fencing token**：抢占时 +1，旧持有者的写入据此被拒（防脑裂双写）。
+//
+// 抢占语义（两方言同款，见 `repo.ts` 的 claimInstance / `pg.ts` 同名方法）：
+//   `INSERT … ON CONFLICT(id) DO UPDATE SET … WHERE host_id IS NULL OR lease_until < now`
+//   —— 冲突时仅在"无人持有或租约过期"才更新；否则**不动行也不报错**，
+//   调用方以「受影响行数 0」判定"有人在管"。
+// ⚠️ 时间戳一律 **epoch 毫秒 BIGINT**（与全库一致，勿用 timestamptz）。
+const SQLITE_V7 = `
+CREATE TABLE IF NOT EXISTS dsh_hosts (
+  id             TEXT PRIMARY KEY,
+  endpoint       TEXT NOT NULL,
+  agent_token    TEXT NOT NULL,
+  capacity_mb    INTEGER NOT NULL DEFAULT 0,
+  used_mb        INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT 'up'
+                 CHECK (status IN ('up','draining','down')),
+  last_heartbeat INTEGER
+);
+ALTER TABLE dsh_instances ADD COLUMN host_id      TEXT;
+ALTER TABLE dsh_instances ADD COLUMN epoch        INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE dsh_instances ADD COLUMN heartbeat_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE dsh_instances ADD COLUMN lease_until  INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_dsh_instances_host  ON dsh_instances (host_id);
+CREATE INDEX IF NOT EXISTS idx_dsh_instances_lease ON dsh_instances (lease_until);
+`
+
+const PG_V7 = `
+CREATE TABLE IF NOT EXISTS dsh_hosts (
+  id             TEXT PRIMARY KEY,
+  endpoint       TEXT NOT NULL,
+  agent_token    TEXT NOT NULL,
+  capacity_mb    BIGINT NOT NULL DEFAULT 0,
+  used_mb        BIGINT NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT 'up'
+                 CHECK (status IN ('up','draining','down')),
+  last_heartbeat BIGINT
+);
+ALTER TABLE dsh_instances ADD COLUMN host_id      TEXT;
+ALTER TABLE dsh_instances ADD COLUMN epoch        BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE dsh_instances ADD COLUMN heartbeat_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE dsh_instances ADD COLUMN lease_until  BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_dsh_instances_host  ON dsh_instances (host_id);
+CREATE INDEX IF NOT EXISTS idx_dsh_instances_lease ON dsh_instances (lease_until);
+`
+
 interface Migration {
   version: number
   name: string
@@ -306,6 +359,7 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 4, name: 'instance desired state', sqlite: SQLITE_V4, pg: PG_V4 },
   { version: 5, name: 'business plugin candidate pool', sqlite: SQLITE_V5, pg: PG_V5 },
   { version: 6, name: 'user model providers', sqlite: SQLITE_V6, pg: PG_V6 },
+  { version: 7, name: 'cluster host registry + instance lease', sqlite: SQLITE_V7, pg: PG_V7 },
 ]
 
 /** Apply unapplied SQLite migrations inside a single transaction. */

@@ -7,12 +7,15 @@
 
 import type {
   BusinessPlugin,
+  ClaimResult,
   CredentialKey,
   CredentialKeyMeta,
   CredentialLandingRow,
   CreateSessionInput,
   CreateUserInput,
   Domain,
+  DshHost,
+  DshHostStatus,
   DshInstance,
   DshInstanceRole,
   DshInstanceStatus,
@@ -20,6 +23,7 @@ import type {
   SessionRow,
   SessionUser,
   UpsertBusinessPluginInput,
+  UpsertDshHostInput,
   UpsertDshInstanceInput,
   User,
   UserRole,
@@ -104,6 +108,41 @@ export interface DbAdapter {
   ): Promise<boolean>
   deleteInstance(id: string): Promise<boolean>
   deleteUserInstances(userId: string): Promise<void>
+  // ── 集群化：worker 注册表 + 实例归属/租约（v7；T08 S2 / 设计 §3.1–§3.2）──
+  // ⚠️ local 模式**不写**这些表（`LocalSpawner` 靠进程内 Map + 单机互斥），
+  //    所以这些方法在单机路径上恒为"空/未认领"，不影响现有行为。
+  /** 注册/更新一台 worker（join 幂等：同 id 重复执行 = 更新）。 */
+  upsertDshHost(input: UpsertDshHostInput): Promise<DshHost>
+  findDshHost(id: string): Promise<DshHost | undefined>
+  listDshHosts(): Promise<DshHost[]>
+  /** 心跳/状态上报：可只改状态，或同时带上容量水位与心跳时间。 */
+  setDshHostStatus(
+    id: string,
+    status: DshHostStatus,
+    usedMb?: number,
+    heartbeatAt?: number,
+  ): Promise<boolean>
+  /**
+   * **原子抢占**某用户的 main 实例归属（承重墙，见设计 §3.2）。
+   * 仅当"无人持有 **或** 租约已过期"才成功；成功时 `epoch` +1（fencing）。
+   * 返回 `ok:false` = 有人在管 ⇒ 调用方**退让**（不是接管）。
+   */
+  claimInstance(
+    userId: string,
+    hostId: string,
+    ttlMs: number,
+    meta?: { folder?: string; patch?: string },
+  ): Promise<ClaimResult>
+  /** 续租。**必须带 epoch**：不匹配说明已被他人抢占 ⇒ 本次续租失败（fencing）。 */
+  renewInstanceLease(userId: string, hostId: string, epoch: number, ttlMs: number): Promise<boolean>
+  /** 主动释放（停实例时）。同样带 epoch 校验，避免误清他人的归属。 */
+  releaseInstanceLease(userId: string, hostId: string, epoch: number): Promise<boolean>
+  /** 钉住归属（首次触达工作区时用）：只写 `host_id`，不动 epoch/租约。 */
+  pinInstanceHost(userId: string, hostId: string): Promise<void>
+  /** 租约已过期、但仍标着归属的实例 —— 供巡检/自愈（**不代表可以立即接管**，见 R9）。 */
+  listExpiredInstanceLeases(now: number): Promise<DshInstance[]>
+  /** 某 worker 上的全部实例 —— 对账用**一次拿回整机**（替代逐用户查询）。 */
+  listInstancesByHost(hostId: string): Promise<DshInstance[]>
   // lifecycle
   close(): Promise<void>
 }

@@ -12,20 +12,25 @@ import { randomUUID } from 'node:crypto'
 import type { Database } from './connection.js'
 import { prepare } from './prepared.js'
 import {
+  clusterInstanceId,
   toBusinessPlugin,
   toDomain,
+  toDshHost,
   toDshInstance,
   toPublicUser,
   toSession,
   toUser,
   toWorkspace,
   type BusinessPlugin,
+  type ClaimResult,
   type CredentialKey,
   type CredentialKeyMeta,
   type CredentialLandingRow,
   type CreateSessionInput,
   type CreateUserInput,
   type Domain,
+  type DshHost,
+  type DshHostStatus,
   type DshInstance,
   type DshInstanceRole,
   type DshInstanceStatus,
@@ -33,6 +38,7 @@ import {
   type SessionRow,
   type SessionUser,
   type UpsertBusinessPluginInput,
+  type UpsertDshHostInput,
   type UpsertDshInstanceInput,
   type User,
   type UserRole,
@@ -43,7 +49,8 @@ const USER_COLS = 'id, username, pass_hash, role, home_dir, api_key_ref, created
 const DOMAIN_COLS = 'id, user_id, domain, verified, nginx_config, updated_at'
 const BUSINESS_PLUGIN_COLS = 'id, name, description, version, tgz_path, file_size, uploaded_by, created_at, updated_at'
 const INSTANCE_COLS =
-  'id, user_id, workspace_id, role, pid, port, status, started_at, last_exit, exit_code, last_error, folder, patch'
+  'id, user_id, workspace_id, role, pid, port, status, started_at, last_exit, exit_code, last_error, folder, patch, '
+  + 'host_id, epoch, heartbeat_at, lease_until' // v7 集群化归属/租约（T08 S2）—— 漏了它们会让 hostId 恒为 null
 
 export function createUser(db: Database, input: CreateUserInput, baseUid: number): User {
   const createdAt = Date.now()
@@ -581,4 +588,164 @@ export function upsertBusinessPlugin(db: Database, input: UpsertBusinessPluginIn
 export function deleteBusinessPlugin(db: Database, id: string): boolean {
   const info = prepare(db, 'DELETE FROM business_plugins WHERE id = ?').run(id)
   return info.changes > 0
+}
+
+// ── 集群化：worker 注册表 + 实例归属/租约（v7；T08 S2 / 设计 §3.1–§3.2）────────
+//
+// ⚠️ local 模式**不调用**这些函数（`LocalSpawner` 靠进程内 Map + 单机互斥），
+//    所以它们的存在不会改变现有单机行为。
+
+const HOST_COLS = 'id, endpoint, agent_token, capacity_mb, used_mb, status, last_heartbeat'
+
+/** 注册/更新一台 worker。join 幂等：同 id 重复执行 = 更新（并把它标回 `up`）。 */
+export function upsertDshHost(db: Database, input: UpsertDshHostInput): DshHost {
+  prepare(db, `
+    INSERT INTO dsh_hosts (id, endpoint, agent_token, capacity_mb, used_mb, status, last_heartbeat)
+    VALUES (?, ?, ?, ?, 0, ?, NULL)
+    ON CONFLICT(id) DO UPDATE SET
+      endpoint    = excluded.endpoint,
+      agent_token = excluded.agent_token,
+      capacity_mb = excluded.capacity_mb,
+      status      = excluded.status
+  `).run(input.id, input.endpoint, input.agentToken, input.capacityMb, input.status ?? 'up')
+  const row = prepare(db, `SELECT ${HOST_COLS} FROM dsh_hosts WHERE id = ?`).get(input.id)
+  return toDshHost(row as Record<string, unknown>)
+}
+
+export function findDshHost(db: Database, id: string): DshHost | undefined {
+  const row = prepare(db, `SELECT ${HOST_COLS} FROM dsh_hosts WHERE id = ?`).get(id)
+  return row ? toDshHost(row as Record<string, unknown>) : undefined
+}
+
+export function listDshHosts(db: Database): DshHost[] {
+  const rows = prepare(db, `SELECT ${HOST_COLS} FROM dsh_hosts ORDER BY id ASC`).all() as Array<
+    Record<string, unknown>
+  >
+  return rows.map((row) => toDshHost(row))
+}
+
+/** 心跳/状态上报（只更新显式给出的字段，避免 heartbeat 覆盖 status）。 */
+export function setDshHostStatus(
+  db: Database,
+  id: string,
+  status: DshHostStatus,
+  usedMb?: number,
+  heartbeatAt?: number,
+): boolean {
+  const info = prepare(db, `
+    UPDATE dsh_hosts
+       SET status = ?,
+           used_mb = COALESCE(?, used_mb),
+           last_heartbeat = COALESCE(?, last_heartbeat)
+     WHERE id = ?
+  `).run(status, usedMb ?? null, heartbeatAt ?? null, id)
+  return info.changes > 0
+}
+
+/**
+ * **原子抢占**某用户 main 实例的归属（承重墙）。仅当"无人持有 **或** 租约已过期"才成功，
+ * 成功时 `epoch` +1（fencing token）。失败时返回当前持有者与租约到期时刻。
+ */
+export function claimInstance(
+  db: Database,
+  userId: string,
+  hostId: string,
+  ttlMs: number,
+  meta?: { folder?: string; patch?: string },
+): ClaimResult {
+  const now = Date.now()
+  const id = clusterInstanceId(userId)
+  // 新用户没有 dsh_instances 行 ⇒ 先保证行存在（否则 UPDATE 影响 0 行被误判为"有人在管"）。
+  prepare(db, `
+    INSERT INTO dsh_instances (id, user_id, role, status)
+    VALUES (?, ?, 'main', 'starting')
+    ON CONFLICT(id) DO NOTHING
+  `).run(id, userId)
+  // ⚠️ **必须把 folder/patch 一起落库**（2026-09-15 实测踩到）：集群模式下实例行是这里建的，
+  //    而 local 模式不写库 ⇒ 若这里不记，`folder` 永远是 NULL，**迁移时复现不了启动参数**
+  //    （表现为 `bwrap: Can't chdir to :` 空路径 ⇒ 崩溃循环）。用 COALESCE 保证不覆盖已有值。
+  const info = prepare(db, `
+    UPDATE dsh_instances
+       SET host_id = ?, epoch = epoch + 1, heartbeat_at = ?, lease_until = ?,
+           folder = COALESCE(?, folder), patch = COALESCE(?, patch)
+     WHERE id = ? AND (host_id IS NULL OR lease_until < ?)
+  `).run(hostId, now, now + ttlMs, meta?.folder ?? null, meta?.patch ?? null, id, now)
+  const row = prepare(db, 'SELECT host_id, epoch, lease_until FROM dsh_instances WHERE id = ?').get(id) as
+    | { host_id: string | null; epoch: number; lease_until: number }
+    | undefined
+  if (row === undefined) return { ok: false, holder: null, leaseUntil: 0 }
+  return info.changes > 0
+    ? { ok: true, epoch: row.epoch, leaseUntil: row.lease_until }
+    : { ok: false, holder: row.host_id, leaseUntil: row.lease_until }
+}
+
+/** 续租。**必须带 epoch**：不匹配说明已被他人抢占 ⇒ 返回 false（fencing 生效）。 */
+export function renewInstanceLease(
+  db: Database,
+  userId: string,
+  hostId: string,
+  epoch: number,
+  ttlMs: number,
+): boolean {
+  const now = Date.now()
+  const info = prepare(db, `
+    UPDATE dsh_instances SET heartbeat_at = ?, lease_until = ?
+     WHERE id = ? AND host_id = ? AND epoch = ?
+  `).run(now, now + ttlMs, clusterInstanceId(userId), hostId, epoch)
+  return info.changes > 0
+}
+
+/**
+ * 主动释放**租约**（停实例时）。带 epoch 校验，避免误清他人的归属。
+ *
+ * ⚠️ **只清 `lease_until`，保留 `host_id`**（2026-09-15 生产切换暴露）：
+ * `host_id` 的语义是「**这个用户的数据在哪台机器**」—— 用户的工作区在**本地盘**上，
+ * 把归属一起清掉就等于**丢掉粘性锚点**，下次启动可能被调度到没有他数据的机器上（工作区看起来是空的）。
+ * 「谁现在在托管」是**租约**（`lease_until`）的语义，所以释放只该清租约。
+ */
+export function releaseInstanceLease(db: Database, userId: string, hostId: string, epoch: number): boolean {
+  const info = prepare(db, `
+    UPDATE dsh_instances SET lease_until = 0
+     WHERE id = ? AND host_id = ? AND epoch = ?
+  `).run(clusterInstanceId(userId), hostId, epoch)
+  return info.changes > 0
+}
+
+/**
+ * **钉住**某用户的归属（首次触达其工作区时用）：只写 `host_id`，不动 epoch/租约。
+ *
+ * 为什么需要：新用户还没有归属，`selectHost` 会在**写文件那一步**与**launch 那一步**各自选一次，
+ * 两次可能选到不同机器 ⇒ 「文件写到 A、实例起在 B」⇒ 实例看不到自己的文件（2026-09-15 实测）。
+ * 首次触达就把归属钉住，后续（含 launch）都走粘性，两面必然一致。
+ */
+export function pinInstanceHost(db: Database, userId: string, hostId: string): void {
+  const now = Date.now()
+  const id = clusterInstanceId(userId)
+  prepare(db, `
+    INSERT INTO dsh_instances (id, user_id, role, status, host_id, epoch, heartbeat_at, lease_until)
+    VALUES (?, ?, 'main', 'stopped', ?, 0, 0, 0)
+    ON CONFLICT(id) DO NOTHING
+  `).run(id, userId, hostId)
+  prepare(db, `
+    UPDATE dsh_instances SET host_id = ?
+     WHERE id = ? AND (host_id IS NULL OR lease_until < ?)
+  `).run(hostId, id, now)
+}
+
+/** 租约过期但仍标着归属的 main 实例（供巡检/自愈；**不等于可以立即接管**，见 R9）。 */
+export function listExpiredInstanceLeases(db: Database, now: number): DshInstance[] {
+  const rows = prepare(db, `
+    SELECT ${INSTANCE_COLS} FROM dsh_instances
+     WHERE role = 'main' AND host_id IS NOT NULL AND lease_until < ? AND status <> 'stopped'
+     ORDER BY lease_until ASC
+  `).all(now) as Array<Record<string, unknown>>
+  return rows.map((row) => toDshInstance(row))
+}
+
+/** 某 worker 上的全部实例 —— 对账**一次拿回整机**（替代逐用户查询）。 */
+export function listInstancesByHost(db: Database, hostId: string): DshInstance[] {
+  const rows = prepare(db, `SELECT ${INSTANCE_COLS} FROM dsh_instances WHERE host_id = ? ORDER BY user_id ASC`).all(
+    hostId,
+  ) as Array<Record<string, unknown>>
+  return rows.map((row) => toDshInstance(row))
 }

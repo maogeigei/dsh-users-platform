@@ -1,6 +1,6 @@
 {
   "name": "dsh-users-platform",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "AGPL-3.0-only",
   "description": "DSH 用户平台（DSH Users Platform）：把 DeepSeek Harness（DSH）变成可对公网运营的多租户服务 —— 注册审核、每用户隔离实例、网页桌面、插件与技能管理、一键部署。",
   "type": "module",
@@ -24,7 +24,7 @@
     "prepare": "npm run build",
     "dev": "node lib/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "npm run build && node --test test/db.test.mjs test/local-user-fs.test.mjs test/crash-policy.test.mjs && node scripts/verify-inject.cjs lib/supervisor/proxy.js && node scripts/verify-static.mjs && node scripts/verify-model-landing.mjs && node scripts/verify-dsh-install.mjs",
+    "verify": "npm run build && node --test test/db.test.mjs test/local-user-fs.test.mjs test/crash-policy.test.mjs && node scripts/verify-inject.cjs lib/supervisor/proxy.js && node scripts/verify-static.mjs && node scripts/verify-model-landing.mjs && node scripts/verify-dsh-install.mjs && node scripts/verify-my-skills.mjs",
     "test": "npm run build && node --test test/db.test.mjs test/local-user-fs.test.mjs test/crash-policy.test.mjs && node scripts/verify-inject.cjs lib/supervisor/proxy.js",
     "smoke": "node scripts/smoke.mjs",
     "smoke:admin": "node scripts/smoke-admin.mjs",

@@ -7,7 +7,7 @@
 在公网**安全托管** [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）：用户自助注册、管理员审核，各自获得一套**独立实例**与文件根。
 
 [![Node](https://img.shields.io/badge/node-%5E22.19%20%7C%20%3E%3D24-339933.svg)](https://nodejs.org/)
-[![Version](https://img.shields.io/badge/version-v1.1.0-informational.svg)](#版本更新说明)
+[![Version](https://img.shields.io/badge/version-v1.2.0-informational.svg)](#版本更新说明)
 [![dsh](https://img.shields.io/badge/dsh-0.1.5--rc.1-4D6BFE.svg)](https://github.com/deepseek-ai/deepseek-harness)
 [![AI-generated](https://img.shields.io/badge/code%20%26%20docs-AI--generated-8A2BE2.svg)](manual/project.zh-CN.md#ai-生成)
 [![Built with](https://img.shields.io/badge/DeepSeek%20V4%20%2F%20V4.1%20flash-2F6FED.svg)](manual/project.zh-CN.md#ai-生成)
@@ -45,7 +45,7 @@
 
 ## 亮点
 
-六组主题，各一句话：
+七组主题，各一句话：
 
 | # | 主题 | 一句话 |
 |---|---|---|
@@ -55,6 +55,7 @@
 | 4 | **模型与访问面** | 平台自己写凭据（官方模型页在托管环境必失效），并读实例自带的厂家目录；访问可用子路径 / 子域 / 自定义域名 |
 | 5 | **可测与可回归** | 关键决策都是纯函数，不起实例就能单测；另有 9 个端到端冒烟 |
 | 6 | **部署与运维** | 一键部署、幂等可预演、反代自适应 |
+| 7 | **集群模式** | 控制面可拆成「管理节点 + 若干工作节点」：归属由 **Postgres 里的原子租约**裁定（TTL &gt; 2 × 续租，每次写入带 epoch），工作节点沿用单机那套 spawner —— **加机器不改变隔离语义** |
 
 👉 **详见 [manual/highlights.zh-CN.md](manual/highlights.zh-CN.md)**
 
@@ -66,6 +67,19 @@
 
 **请求链路**：浏览器 → nginx（TLS）→ 控制面（认证 / 审核 / 管理面 / 网页桌面）→ 按 `Host` 或 `/u/<userId>/dsh/*` 路由 → 用户实例（只绑回环）。
 **自愈链路**：崩溃 → 按需拉起守护实例修一次 profile → 自动重启；反复崩溃则退避 + 熔断。
+
+### 集群模式
+
+<img src="diagrams/architecture-cluster.zh-CN.svg" width="100%" alt="集群架构图：浏览器 → nginx → 管理节点（归属租约 + 共享数据库）→ worker agent → 每用户实例">
+
+上面那种单机部署**仍是默认**；集群模式把它拆到多台主机上，**而用户得到的东西不变**：
+
+| 部件 | 它做什么 |
+|---|---|
+| **归属租约** | 「一个用户同时只有一个活实例」由 **Postgres 里的原子抢占**裁定 —— 单机模式靠进程内 Map 天然拿到这个保证。租约带 `TTL > 2 × 续租间隔`（构造时硬校验），每次写入带 **epoch**：epoch 过期的节点会**停掉自己的实例**，而不是继续写 |
+| **worker agent** | 工作节点上**唯一的被拨入口**（令牌鉴权）。它暴露实例生命周期与文件操作，并**复用单机那套 spawner 与同一份路径安全代码** —— 所以 bwrap / uid / scope 隔离、内存配额、崩溃退避与熔断、插件探活的行为完全一致。工作节点**只拨入、不反连**，接口只接受白名单动作且参数受限 |
+| **共享数据库** | 工作节点注册表 + 实例归属（`host_id` / `epoch` / `lease_until`） |
+| **一条基线** | 各工作节点必须用**同一个绝对数据根**；不一致时在**启动阶段**报出来，而不是拖到第一次请求才暴露 |
 
 👉 **详见 [manual/architecture.zh-CN.md](manual/architecture.zh-CN.md)**
 
@@ -211,6 +225,13 @@ curl -I https://test.dsh.example.com/                     # 期望 401（未登�
 📦 **改造示例：[examples/dsh-univer-office/](examples/dsh-univer-office/)** —— 改造补丁 + 新增模块 + 配套技能，附上游基线与应用方法。
 
 ## 版本更新说明
+
+### v1.2.0 —— 2026-09-15 · 特性
+
+- **集群模式** —— 控制面可以跨主机拆分运行：一个管理节点 + 若干工作节点，带**实例归属租约**（避免两台机器上的重启互相抢）、远程 spawner，以及用于文件与实例操作的 host-agent 通道。**单机模式不变，仍是默认**。
+- **多语言运行时** —— 平台界面增加运行时 i18n 层，界面语言不再写死在页面里。
+- **实例内「我的技能」分组** —— 由平铺列表改为分组展示。
+- **修复** —— 部署模式解析器仍接受已下线模式的取值，而类型里已不再声明它（构建期类型错误被漏过）；现在两者一致，**该废弃取值在启动时直接报错**，不再被放行。
 
 ### v1.1.0 —— 2026-09-14 · 特性
 

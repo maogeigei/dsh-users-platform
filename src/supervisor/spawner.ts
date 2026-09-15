@@ -92,7 +92,22 @@ export interface Endpoint {
  * `LocalSpawner` materializes it to a file inside the user's own volume.
  */
 export interface Spawner {
-  launch(userId: string, folder: string, patch?: string, opts?: { force?: boolean }): Promise<Instance>
+  /**
+   * 拉起实例。
+   *
+   * `opts.epoch`（T08 S4）：**集群模式下 epoch 是 launch 契约的一部分** —— Manager 先抢占
+   * 归属拿到 epoch，再把它随 launch 下发，worker 记下来用于 **self-fencing**
+   * （收到更高 epoch 就停掉自己那个实例）。本地模式忽略该字段。
+   *
+   * `opts.hostId`（T08 S6）：**多 worker 时指定落到哪台** —— 由上层选好机、并已用它认领租约，
+   * 因此这里必须与租约的 `host_id` 一致（否则归属与实例分离）。单机/1a 忽略。
+   */
+  launch(
+    userId: string,
+    folder: string,
+    patch?: string,
+    opts?: { force?: boolean; epoch?: number; hostId?: string },
+  ): Promise<Instance>
   restartMain(userId: string): Promise<Instance | undefined>
   /**
    * 熔断观测面（可选）。
@@ -112,7 +127,7 @@ export interface Spawner {
   spawnWatchdog(userId: string): Promise<Instance | undefined>
   status(userId: string): Promise<UserStatus>
   endpointFor(userId: string): Promise<Endpoint | undefined>
-  stop(userId: string): Promise<void>
+  stop(userId: string, hostId?: string): Promise<void>
   teardown(): Promise<void>
   /** 等待该用户 main 实例打印 launch token（本地模式 = 启动完成的信号）。无实例 /
    * 已崩溃 / 已停 → 立即返回。供 enter 复用分支在返回

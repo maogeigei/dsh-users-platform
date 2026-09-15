@@ -13,10 +13,13 @@ import { chown, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import type { ServerConfig } from '../config.js'
 import { createDbAdapter, type CredentialLandingRow, type DbAdapter, type PublicUser } from '../db/index.js'
 import { createUserFs } from '../fs/provider.js'
+import { RemoteUserFs } from '../fs/remote-user-fs.js'
 import type { UserFs } from '../fs/user-fs.js'
 import { decrypt, deriveKey } from '../crypto.js'
 import { hashUid } from '../isolation.js'
 import { LocalSpawner } from '../supervisor/orchestrator.js'
+import { LeasedSpawner } from '../supervisor/leased-spawner.js'
+import { RemoteSpawner, type ClusterHost } from '../supervisor/remote-spawner.js'
 import { registerDshProxy } from '../supervisor/proxy.js'
 import type { Spawner } from '../supervisor/spawner.js'
 import {
@@ -256,8 +259,147 @@ export async function buildServer(config: ServerConfig): Promise<FastifyInstance
     const user = await db.findUserById(userId)
     return user?.uid ?? hashUid(userId, config.baseUid)
   }
-  const supervisor: Spawner = new LocalSpawner(config, resolveApiKey, resolveUid)
-  const userFs = createUserFs(config)
+  // cluster 模式（T08 S3/S4）：实例在 worker 上，Manager 只投递操作 + 代理。
+  // fail-loud：没配 agent 地址就直接报错，别等第一个用户点进来才发现。
+  if (config.deployMode === 'cluster' && config.clusterAgentUrl === '') {
+    throw new Error('deployMode=cluster requires DSH_USERS_PLATFORM_CLUSTER_AGENT_URL (e.g. http://127.0.0.1:9000)')
+  }
+  // cluster：RemoteSpawner（传输）+ LeasedSpawner（**归属租约**）——
+  // 后者保证"能不能拉起先问归属"，这是多机下防双写同一个 home 的承重件（设计 §3.2）。
+  let leased: LeasedSpawner | undefined
+  // ── 多 worker 的 host 目录（T08 S6）────────────────────────────────────
+  // 由 `dsh_hosts` 派生并**随用随刷新**（TTL 30 s）⇒ **新增 worker 不必重启 Manager**。
+  // 同时供三处使用：RemoteSpawner 的按 host 路由、LeasedSpawner 的 fence 目标、
+  // 以及 `selectHost` 的容量准入 —— 都读**同一份**内存目录，避免三套各自漂移。
+  const hostDirectory = new Map<string, ClusterHost>()
+  hostDirectory.set(config.clusterHostId, {
+    hostId: config.clusterHostId,
+    agentUrl: config.clusterAgentUrl,
+    token: config.clusterAgentToken,
+    instanceHost: config.clusterInstanceHost,
+  })
+  const hostsProvider = async (): Promise<ClusterHost[]> => {
+    for (const row of await db.listDshHosts()) {
+      hostDirectory.set(row.id, {
+        hostId: row.id,
+        agentUrl: row.endpoint,
+        token: row.agentToken,
+        instanceHost: config.clusterInstanceHost,
+      })
+    }
+    return [...hostDirectory.values()]
+  }
+  /**
+   * 按用户归属解析 host（实例面与**文件面**共用这一份，避免两套路由漂移）。
+   *
+   * 为什么两处都要用：用户工作区在**那台 worker 的本地盘**；若文件面固定打一台 agent，
+   * 就会出现「实例跑在 A、mkdir/上传写到 B」⇒ 实例看不到自己的文件、甚至 cwd 不存在而崩
+   * （2026-09-15 生产切换暴露）。
+   */
+  const hostIdForUser = async (userId: string): Promise<string | undefined> =>
+    (await db.findUserInstance(userId, 'main'))?.hostId ?? undefined
+
+  /**
+   * **文件面专用**路由：没有归属就**先选机并钉住**。
+   *
+   * 为什么不能直接用 hostIdForUser：新用户还没有归属，"写文件"和"launch"会各自选一次机，
+   * 两次可能选到不同机器 ⇒「文件写到 A、实例起在 B」⇒ 实例看不到自己的文件（2026-09-15 实测）。
+   * 首次触达工作区就把归属钉住，后续（含 launch）全走粘性 ⇒ 两面必然一致。
+   */
+  const hostIdForFile = async (userId: string): Promise<string | undefined> => {
+    const owned = await hostIdForUser(userId)
+    if (owned !== undefined && owned !== null) return owned
+    const chosen = (await selectHost(userId)) ?? config.clusterHostId
+    if (chosen === '') return undefined
+    await db.pinInstanceHost(userId, chosen)
+    return chosen
+  }
+  /**
+   * 选机：**① 粘性优先 ② 再按容量准入**。
+   *
+   * ⚠️ 顺序不能颠倒（2026-09-15 生产切换时补的缺口）：用户工作区在**本地盘**、跟着机器走，
+   * 把"已有历史数据的用户"调度到另一台 ⇒ 他打开实例看到**空工作区**。
+   * ⇒ 有历史归属且那台还 `up` 就留在原地；只有**从未有过归属**（新用户）才按容量挑最空的。
+   * `capacityMb <= 0` = 未声明（不设限）；`-1` = 显式禁用承载。
+   */
+  const reserveMb = Number(process.env.DSH_USERS_PLATFORM_CLUSTER_RESERVE_MB ?? '512')
+  const selectHost = async (userId?: string): Promise<string | undefined> => {
+    const rows = await db.listDshHosts()
+    const eligible = rows.filter((h) => h.status === 'up' && h.capacityMb !== -1)
+    if (userId !== undefined) {
+      const owned = (await db.findUserInstance(userId, 'main'))?.hostId ?? null
+      if (owned !== null && eligible.some((h) => h.id === owned)) return owned
+    }
+    const candidates = eligible.filter(
+      (h) => h.capacityMb <= 0 || h.usedMb + reserveMb <= h.capacityMb,
+    )
+    if (candidates.length === 0) return undefined // 无候选 ⇒ 回退到配置里那台
+    candidates.sort((a, b) => a.usedMb - b.usedMb)
+    return candidates[0].id
+  }
+  const supervisor: Spawner =
+    config.deployMode === 'cluster'
+      ? (leased = new LeasedSpawner(
+          new RemoteSpawner({
+            agentUrl: config.clusterAgentUrl,
+            token: config.clusterAgentToken,
+            instanceHost: config.clusterInstanceHost,
+            defaultHostId: config.clusterHostId,
+            hostsProvider,
+            resolveApiKey,
+            resolveUid,
+            // 按 host 路由：每次操作都落到"该用户实例所在那台"（与文件面同一份）
+            hostIdFor: hostIdForUser,
+          }),
+          db,
+          {
+            hostId: config.clusterHostId,
+            agentUrl: config.clusterAgentUrl,
+            agentToken: config.clusterAgentToken,
+            capacityMb: Number(process.env.DSH_USERS_PLATFORM_CLUSTER_CAPACITY_MB ?? '0'),
+            // 专用 Manager 部署设 DSH_USERS_PLATFORM_CLUSTER_REGISTER_SELF=0（见 LeasedSpawner 的注释）
+            registerSelf: (process.env.DSH_USERS_PLATFORM_CLUSTER_REGISTER_SELF ?? '1') !== '0',
+            ttlMs: Number(process.env.DSH_USERS_PLATFORM_CLUSTER_LEASE_TTL_MS ?? '30000'),
+            renewMs: Number(process.env.DSH_USERS_PLATFORM_CLUSTER_LEASE_RENEW_MS ?? '10000'),
+            selectHost,
+            agentFor: (hostId: string) => {
+              const h = hostDirectory.get(hostId)
+              return h === undefined ? undefined : { agentUrl: h.agentUrl, token: h.token }
+            },
+          },
+        ))
+      : new LocalSpawner(config, resolveApiKey, resolveUid)
+  // 注册本机 + 起心跳（异步，不阻塞启动；心跳失败只影响该 worker 的状态位）
+  if (leased !== undefined) {
+    void leased.start().catch((err: unknown) => {
+      console.error('[cluster] heartbeat/register failed to start:', err)
+    })
+  }
+  const userFs = createUserFs(config, {
+    hostIdFor: hostIdForFile,
+    agentFor: (hostId: string) => {
+      const h = hostDirectory.get(hostId)
+      return h === undefined ? undefined : { agentUrl: h.agentUrl, token: h.token }
+    },
+  })
+  // T08 S5：cluster 模式下**所有 worker 的 dataRoot 必须是同一绝对路径**（基线约定，
+  // 设计 §14.3）。不一致会让 `resolvePath` 算出的"实例眼里的路径"与实际不符 ⇒
+  // 文件面与 launch 的 folder 都会错。这里在启动时**报出来**，别等用户点进去才发现。
+  if (userFs instanceof RemoteUserFs) {
+    void userFs
+      .probeWorkerRoot()
+      .then((root) => {
+        if (root !== undefined && root !== userFs.workerDataRoot) {
+          console.error(
+            `[cluster] worker dataRoot 与配置不一致：agent 报 ${root}，本进程按 ${userFs.workerDataRoot} 计算路径。` +
+              '请把 DSH_USERS_PLATFORM_CLUSTER_WORKER_DATA_ROOT 设为 worker 上的实际值（所有 worker 必须同路径）。',
+          )
+        }
+      })
+      .catch(() => {
+        /* 探测失败不阻塞启动：会有心跳/调用失败暴露 */
+      })
+  }
 
   const app = Fastify({
     logger: { level: config.logLevel },
