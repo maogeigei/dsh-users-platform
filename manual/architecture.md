@@ -48,7 +48,7 @@ That page requires a **host-settings mirror** and decides persistence with `isLo
 
 ### 3. Client-plugin `inject` and the official UI packages **[measured]**
 
-Upstream's plugin mechanism lets a client plugin declare `dsh.client.inject`. The platform's role patch **disables several official UI packages**, so a plugin that injects one of them waits forever — **no error, no log**, the browser half simply never runs.
+Upstream's plugin mechanism lets a client plugin declare `dsh.client.inject`. The platform's role patch **disables several official UI packages per role**, so a plugin injects only packages that are delivered in the role it targets.
 
 **What the platform does instead**: see [PLUGIN-PORTING.md §H7](../PLUGIN-PORTING.md) — plugin authors must not inject official UI packages unless they are guaranteed to be delivered in that role.
 

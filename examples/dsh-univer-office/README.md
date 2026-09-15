@@ -63,7 +63,7 @@ cp -r /path/to/new-files/src/* src/        # the added modules (not in the patch
    **leave it unset and upstream behaviour is preserved exactly** ⇒ **upstream-friendly (the default behaviour is unchanged, so it can be merged safely)**, and rolling back means simply **deleting that env**.
 2. **Only two proxy rules** — all of this plugin's data-plane requests live under one prefix (WebSocket included):
    `/uf/**` → forward to the gateway (HTTP + WS upgrade); `/<plugin>-api/viewer/**` → forward to the gateway's page and static assets.
-   ⚠️ Once the Viewer page has loaded it requests `/uf/*` **using absolute paths**, so the proxy **must take over `/uf/*`** — otherwise you get the classic "the page opens but the data never arrives" **half-working** state.
+   ⚠️ Once the Viewer page has loaded it requests `/uf/*` **using absolute paths**, so the proxy **must take over `/uf/*`**.
 3. **Two subtle platform-side pitfalls** —
    ① the platform's prefix matching has **no "longest wins"**: a shorter `/myplugin-api` **swallows** `/myplugin-api/viewer/...` ⇒ the viewer proxy must live **inside the existing router's dispatch**;
    ② WS routes register **exact paths**, while the plugin's WS paths contain **dynamic segments** ⇒ they can only be **registered lazily per file** (seed on file open, de-duplicate with a Map, dispose them together).
