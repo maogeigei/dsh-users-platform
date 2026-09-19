@@ -1,0 +1,90 @@
+# 供应链 CI：构建两个镜像 → 功能冒烟 → Trivy 高危阻断 → push 到 ACR。
+#
+# 单 job（build-and-scan）：镜像在 job 内 build + load，冒烟 + Trivy 过后，
+# master 推送时再 tag + push 到阿里云 ACR（用 ACR_USERNAME / ACR_PASSWORD
+# secret）。仓库：registry.example.com/dsh/
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install + typecheck
+        run: |
+          npm ci
+          npm run typecheck
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build control-plane image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: dsh-users-platform:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke — control plane (bootstrap-admin + serve)
+        run: |
+          # bootstrap-admin as the non-root image user (uid 65532), default data root.
+          docker run --rm dsh-users-platform:ci bootstrap-admin \
+            --username admin --password 'ci-test-password'
+          # Boot the server and publish 3080 so the host can reach it, then probe.
+          docker run --rm -d --name dsh-cp -p 3080:3080 dsh-users-platform:ci \
+            --host 0.0.0.0 --port 3080
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:3080/ >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # On failure, surface the server logs before the step aborts.
+          curl -fsS http://127.0.0.1:3080/ >/dev/null || { docker logs dsh-cp; exit 1; }
+          echo "control plane serving OK"
+          docker logs dsh-cp
+          docker stop dsh-cp
+
+      - name: Trivy — control plane
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: dsh-users-platform:ci
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          # 只阻断「可修复」的高危；收紧为 false 则连不可修复的也拦。
+          ignore-unfixed: true
+
+      # --- push to ACR (master push / manual dispatch on master only) ---
+      - name: Login to ACR
+        if: github.ref == 'refs/heads/master'
+        uses: docker/login-action@v3
+        with:
+          registry: registry.example.com
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Push control plane to ACR
+        if: github.ref == 'refs/heads/master'
+        run: |
+          docker tag dsh-users-platform:ci \
+            registry.example.com/dsh/dsh-users-platform:0.2.0
+          docker push \
+            registry.example.com/dsh/dsh-users-platform:0.2.0
+
