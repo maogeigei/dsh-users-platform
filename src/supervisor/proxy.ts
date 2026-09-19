@@ -444,7 +444,7 @@ function proxyHttp(
         //   且**普通刷新会命中缓存的外壳、复现不消失**（2026-09-14 真实事故：当天连铺 4 次插件 + 2 次重启平台）。
         //   ⇒ 外壳加 no-cache 后，浏览器每次都会回源取到**当前**的外壳与 rev。
         //
-        // ⚠️ 勿删：这是 UI 改动能否被验收的前置机制（`06-工作台UI规范 §6.5`）。
+        // ⚠️ 勿删：这是 UI 改动能否被验收的前置机制（`工作台 UI 规范`）。
         if (
           targetPath.startsWith('/plugins/') ||
           targetPath.startsWith('/assets/') ||

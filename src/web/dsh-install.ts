@@ -4,7 +4,7 @@
  * 为什么必须有这一层：**`npm i -g` 的落点随发行版 / npm prefix 而变** —— 实测
  *   · Debian 系常见 `/usr/local/lib/node_modules`（npm 默认 `prefix=/usr/local`）
  *   · 以发行版包管理器装的 Node（OpenCloudOS / CentOS / 宝塔 等）常见 `/usr/lib/node_modules`
- *     （本平台测试服 `test106` 就是这种：`/usr/bin/dsh` → `/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js`）
+ *     （例如这种：`/usr/bin/dsh` → `/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js`）
  * 而定位失败**不会报错**：调用方只会静默降级（厂家目录读成空、平台包计数为 0），
  * 表现成「这个功能没做」，排查成本极高（实测：`/api/me/model-providers` 返回 `{"providers":[]}`）。
  * ⇒ 不能写死单一路径，必须**按序探测**。
